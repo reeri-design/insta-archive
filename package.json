@@ -1,0 +1,32 @@
+{
+  "name": "insta-archive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "import:instagram": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/import-instagram-export.ts",
+    "spike:instagram-image": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/instagram-image-spike.ts"
+  },
+  "dependencies": {
+    "next": "16.3.8",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.8",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
