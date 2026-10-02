@@ -11,6 +11,7 @@
     "typecheck": "next typegen && tsc --noEmit",
     "test": "node --test \"src/**/*.test.ts\"",
     "import:instagram": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/import-instagram-export.ts",
+    "retrieve:media": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/retrieve-media.ts",
     "spike:instagram-image": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/instagram-image-spike.ts"
   },
   "dependencies": {

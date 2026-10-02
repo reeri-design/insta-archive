@@ -164,3 +164,15 @@ export function embedShortcodeMedia(html: string): Record<string, unknown> | und
     return undefined;
   }
 }
+
+/**
+ * Instagram's explicit "removed" embed (served with HTTP 200): no media type,
+ * and the text "The link to this photo or video may be broken, or the post
+ * may have been removed." Nothing else is treated as removed.
+ */
+export function isRemovedPostPage(html: string): boolean {
+  return (
+    parseMediaType(html) === undefined &&
+    /link to this photo or video may be broken,?\s+or the post may have been removed/i.test(html)
+  );
+}

@@ -17,7 +17,7 @@ Next.js (App Router) and strict TypeScript. SQLite for metadata and the local fi
 
 ## Status
 
-An Instagram export can be imported into the SQLite archive. The media-retrieval infrastructure exists (queue, storage, adapter contract) but no source adapter yet, so no media is downloaded. There is no AI, search or archive UI yet.
+An Instagram export can be imported into the SQLite archive. Media can be retrieved in controlled, resumable batches (single images, carousels, and Reels as video or sampled frames). There is no AI, search or archive UI yet.
 
 ## Development
 
@@ -48,5 +48,15 @@ npm run import:instagram -- /path/to/instagram-export --owner-sender-name "Your 
   - `--owner-sender-name`: marks DMs from your other accounts as sent by you.
   - `--owner-id`: defaults to `local`. Keep it the same across imports.
   - `--help` lists every option.
+
+## Retrieving media
+
+After importing, fetch media in small batches (start with about 20):
+
+```bash
+npm run retrieve:media -- --limit 20
+```
+
+It is resumable and stops on a rate limit. See `docs/media-retrieval.md` ("Running a retrieval batch").
 
 Requires Node.js 22.13 or later (built-in `node:sqlite`); `npm test` needs 22.18 or later (native TypeScript).

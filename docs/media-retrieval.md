@@ -89,6 +89,31 @@ Sampling keeps the first frame, then the first frame at or after each interval m
 - **The threshold is configurable and experimental.** Its default is 20 MB: the test Reel was 2.17 MB for 12.4 s, about 1.4 Mbit/s, so 20 MB is roughly 2 minutes.
 - **Rerunning a completed Reel fetches nothing,** whichever way it was stored. Changing the threshold later does not convert Reels that are already stored.
 
+## Running a retrieval batch
+
+`npm run retrieve:media -- --limit 20` retrieves media for a small, controlled batch (`src/cli/retrieve-media.ts`, `src/media/media-retrieval-job.ts`). **Start with a small batch** (about 20–50) and check the results before going bigger. Never run the whole archive in one go.
+
+- **Each run:**
+  1. Creates a `pending` retrieval request for every item that has none. This makes no network requests.
+  2. Picks up to `--limit` *due* requests: highest priority first, then the newest item (its latest save, like or DM date).
+  3. Retrieves them one at a time, pausing between items (`--delay-ms`, default 2000).
+- **Priorities:** only two tiers exist: owner exchange (100) and normal (0). Until owner-exchange detection is built, every item is normal. `--from-priority <n>` limits the run to requests with priority ≤ n.
+- **Routing (Instagram):** the item's embed page is fetched once and routed by post type:
+  - single image → image adapter
+  - carousel → carousel adapter
+  - video → Reel strategy (video kept up to the threshold, otherwise frames)
+- **Outcomes per item:**
+  - **Stored:** done. It is never selected or downloaded again.
+  - **Unavailable** (deleted/private/not found, e.g. HTTP 404): not retried automatically.
+  - **Failed** (network, server, timeout, unknown): retried at its scheduled backoff time by a later run. A carousel retry downloads only the slides it is missing.
+  - **Rate limited** (HTTP 429, on the page or on a media download): **the whole batch stops**. That item is scheduled for a later retry. Everything not yet attempted stays `pending`, untouched.
+  - **Unexpected error:** reported and skipped. The item stays as it was and is retried next run.
+- **Resumable:** all progress lives in the retrieval requests. Running the command again continues where it stopped, and work already stored is never lost or repeated.
+- **Output:** one line per item, then counts:
+  - attempted, stored, unavailable, failed/retryable, errors
+  - already stored (skipped), whether a rate limit stopped the run, remaining due
+  - request status totals before and after, and the duration
+
 ## Metadata from retrieval
 
 - Retrieved creator, caption and `postedAt` only **fill fields the export left empty**, recorded with `provenance: retrieval`.

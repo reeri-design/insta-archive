@@ -89,8 +89,12 @@ export class InstagramCarouselSpikeAdapter implements MediaSourceAdapter {
 
     const download = await fetchOrFailure(this.fetch, slide.image.url);
     if (!download.ok) {
-      // CDN URLs are signed and expire; a failed slide download says nothing
-      // about whether the post still exists, so it stays retryable.
+      // A rate limit keeps its code so callers can stop. Otherwise: CDN URLs
+      // are signed and expire; a failed slide download says nothing about
+      // whether the post still exists, so it stays retryable.
+      if (download.failure.code === "rate_limited") {
+        return { mediaType: "image", result: { ok: false, failure: download.failure } };
+      }
       return slideFailure("image", `Slide download failed: ${download.failure.message}`);
     }
     const mimeType = (download.response.headers.get("content-type") ?? "").split(";")[0]?.trim() ?? "";

@@ -68,7 +68,11 @@ export class InstagramReelSpikeAdapter implements MediaSourceAdapter {
     if (!video) return temporary("Embed page has no video URL");
 
     const download = await fetchOrFailure(this.fetch, video.url);
-    if (!download.ok) return temporary(`Video download failed: ${download.failure.message}`);
+    if (!download.ok) {
+      // A rate limit keeps its code so callers can stop; anything else stays retryable.
+      if (download.failure.code === "rate_limited") return fail(download.failure);
+      return temporary(`Video download failed: ${download.failure.message}`);
+    }
     const mimeType = (download.response.headers.get("content-type") ?? "").split(";")[0]?.trim() ?? "";
     if (!mimeType.startsWith("video/")) return temporary(`Expected a video, got "${mimeType}"`);
 

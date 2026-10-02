@@ -84,10 +84,19 @@ export interface ArchiveRepository {
   getMediaRetrievalRequest(itemId: ArchiveItemId): Promise<MediaRetrievalRequest | undefined>;
 
   /**
-   * Requests due at `now` (see isDue): highest priority first, then the
-   * longest-waiting.
+   * Requests due at `now` (see isDue): highest priority first, then by
+   * `order`: the longest-waiting (default), or the newest item (latest
+   * save/like/DM date). Optionally only one owner's items and only
+   * priorities up to `maxPriority`.
    */
-  listDueMediaRetrievals(now: string, limit?: number): Promise<MediaRetrievalRequest[]>;
+  listDueMediaRetrievals(
+    now: string,
+    limit?: number,
+    options?: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest" },
+  ): Promise<MediaRetrievalRequest[]>;
+
+  /** Number of retrieval requests per status. */
+  countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>>;
 
   /** Newest first (createdAt, then id). */
   listArchiveItems(

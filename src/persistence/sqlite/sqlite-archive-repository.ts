@@ -329,17 +329,37 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row && toRequest(row);
   }
 
-  async listDueMediaRetrievals(now: string, limit = 100): Promise<MediaRetrievalRequest[]> {
+  async listDueMediaRetrievals(
+    now: string,
+    limit = 100,
+    options: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest" } = {},
+  ): Promise<MediaRetrievalRequest[]> {
+    const order =
+      options.order === "newest"
+        ? `(SELECT MAX(s.occurred_at) FROM source_records s WHERE s.archive_item_id = r.archive_item_id) DESC NULLS LAST`
+        : "COALESCE(r.next_attempt_at, r.created_at)";
     const rows = this.db
       .prepare(
-        `SELECT * FROM media_retrieval_requests
-         WHERE (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
-            OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= :now)
-         ORDER BY priority DESC, COALESCE(next_attempt_at, created_at), archive_item_id
+        `SELECT r.* FROM media_retrieval_requests r
+         JOIN archive_items i ON i.id = r.archive_item_id
+         WHERE ((r.status = 'pending' AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= :now))
+             OR (r.status = 'failed' AND r.next_attempt_at IS NOT NULL AND r.next_attempt_at <= :now))
+           AND (:owner_id IS NULL OR i.owner_id = :owner_id)
+           AND (:max_priority IS NULL OR r.priority <= :max_priority)
+         ORDER BY r.priority DESC, ${order}, r.archive_item_id
          LIMIT :limit`,
       )
-      .all({ now, limit }) as RequestRow[];
+      .all({ now, limit, owner_id: options.ownerId ?? null, max_priority: options.maxPriority ?? null }) as RequestRow[];
     return rows.map(toRequest);
+  }
+
+  async countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>> {
+    const counts = { pending: 0, stored: 0, failed: 0, unavailable: 0 };
+    const rows = this.db
+      .prepare("SELECT status, COUNT(*) AS n FROM media_retrieval_requests GROUP BY status")
+      .all() as { status: keyof typeof counts; n: number }[];
+    for (const row of rows) counts[row.status] = row.n;
+    return counts;
   }
 
   // -------------------------------------------------------------------------
