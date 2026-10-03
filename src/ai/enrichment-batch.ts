@@ -3,6 +3,7 @@
  * items (or the ones named), one call at a time, stopping on a rate limit.
  */
 import type { ArchiveItemId, UserId } from "../domain/archive-item.ts";
+import { isInMainArchive, MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import type { AiEnrichmentCandidate, ArchiveRepository } from "../persistence/archive-repository.ts";
 import type { AiEnrichmentService, EnrichmentResult } from "./enrichment-service.ts";
 
@@ -80,7 +81,9 @@ export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promi
 
 /**
  * The items a batch will process: the named ones (first `limit`), or a
- * representative sample of items without an AI organization.
+ * representative sample of items without an AI organization. Both are
+ * limited to the main archive (Saved + Messages): liked-only items are
+ * never enriched.
  */
 export async function selectItemsForEnrichment(
   options: Pick<EnrichmentBatchOptions, "repository" | "ownerId" | "limit" | "shortcodes">,
@@ -91,11 +94,15 @@ export async function selectItemsForEnrichment(
     for (const shortcode of options.shortcodes.slice(0, limit)) {
       const item = await repository.findArchiveItemByIdentity(ownerId, { kind: "shortcode", shortcode });
       if (!item) throw new Error(`No archive item for shortcode ${shortcode}`);
+      const aggregate = await repository.getArchiveItemAggregate(item.id);
+      if (!aggregate || !isInMainArchive(aggregate.sources)) {
+        throw new Error(`${shortcode} is not in the main archive (Saved + Messages); liked-only items are not enriched`);
+      }
       ids.push(item.id);
     }
     return ids;
   }
-  return representativeSample(await repository.listAiEnrichmentCandidates(ownerId), limit);
+  return representativeSample(await repository.listAiEnrichmentCandidates(ownerId, { sources: MAIN_ARCHIVE_SOURCES }), limit);
 }
 
 /**

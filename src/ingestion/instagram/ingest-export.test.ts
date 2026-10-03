@@ -230,6 +230,7 @@ function bind(target: SqliteArchiveRepository): ArchiveRepository {
     getMediaRetrievalRequest: (id) => target.getMediaRetrievalRequest(id),
     listDueMediaRetrievals: (now, limit, options) => target.listDueMediaRetrievals(now, limit, options),
     countMediaRetrievalsByStatus: () => target.countMediaRetrievalsByStatus(),
-    listAiEnrichmentCandidates: (o) => target.listAiEnrichmentCandidates(o),
+    listAiEnrichmentCandidates: (o, opts) => target.listAiEnrichmentCandidates(o, opts),
+    searchArchiveItems: (o, q, opts) => target.searchArchiveItems(o, q, opts),
   };
 }

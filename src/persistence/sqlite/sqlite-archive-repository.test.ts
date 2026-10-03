@@ -17,6 +17,7 @@ import type {
   UserId,
 } from "../../domain/archive-item.ts";
 import { importInstagramExport } from "../../importers/instagram/import-export.ts";
+import { isInMainArchive, MAIN_ARCHIVE_SOURCES } from "../../domain/archive-scope.ts";
 import { ArchiveIdentityConflictError, PersistenceIntegrityError } from "../archive-repository.ts";
 import { databasePathFromEnv, migrate, openDatabase } from "./database.ts";
 import { MIGRATIONS } from "./migrations.ts";
@@ -163,6 +164,70 @@ describe("archive items", () => {
       "owner-1:shortcode:A1",
     ]);
     assert.deepEqual(ids(await repo.listArchiveItems(OWNER, { limit: 1, offset: 1 })), ["owner-1:shortcode:B2"]);
+  });
+
+  test("listArchiveItems order 'recent' sorts by the latest save/like/DM date, undated items last", async () => {
+    const item = (sc: string) => `owner-1:shortcode:${sc}` as ArchiveItemId;
+    for (const sc of ["A1", "B2", "C3", "D4"]) {
+      await repo.saveArchiveItem(makeItem({ id: item(sc), identity: { kind: "shortcode", shortcode: sc } }));
+    }
+    await repo.addSourceRecords([
+      makeSource("a-old", item("A1"), { occurredAt: "2026-01-01T00:00:00.000Z" }),
+      makeSource("a-new", item("A1"), { occurredAt: "2026-09-01T00:00:00.000Z", source: "saved" }), // latest wins
+      makeSource("b", item("B2"), { occurredAt: "2026-05-01T00:00:00.000Z" }),
+      makeSource("c", item("C3"), { occurredAt: "2026-12-01T00:00:00.000Z" }),
+      makeSource("d", item("D4"), { occurredAt: undefined }),
+    ]);
+
+    const ids = (items: ArchiveItem[]) => items.map((i) => i.id);
+    assert.deepEqual(ids(await repo.listArchiveItems(OWNER, { order: "recent" })), [item("C3"), item("A1"), item("B2"), item("D4")]);
+    assert.deepEqual(ids(await repo.listArchiveItems(OWNER, { order: "recent", limit: 2, offset: 1 })), [item("A1"), item("B2")]);
+  });
+
+  describe("main archive scope (Saved + Messages)", () => {
+    // One item per combination of source kinds.
+    const COMBOS: Record<string, SourceRecord["source"][]> = {
+      likedOnly: ["liked"],
+      savedOnly: ["saved"],
+      messagesOnly: ["messages"],
+      likedSaved: ["liked", "saved"],
+      likedMessages: ["liked", "messages"],
+      likedSavedMessages: ["liked", "saved", "messages"],
+    };
+    const item = (name: string) => `owner-1:shortcode:${name}` as ArchiveItemId;
+    const IN_SCOPE = ["savedOnly", "messagesOnly", "likedSaved", "likedMessages", "likedSavedMessages"].map(item).sort();
+
+    beforeEach(async () => {
+      for (const [name, kinds] of Object.entries(COMBOS)) {
+        await repo.saveArchiveItem(makeItem({ id: item(name), identity: { kind: "shortcode", shortcode: name } }));
+        await repo.addSourceRecords(kinds.map((source) => makeSource(`${name}:${source}`, item(name), { source })));
+      }
+    });
+    const sorted = (ids: string[]) => [...ids].sort();
+
+    test("listArchiveItems with MAIN_ARCHIVE_SOURCES keeps any item with a saved or messages source, drops liked-only", async () => {
+      const listed = await repo.listArchiveItems(OWNER, { sources: MAIN_ARCHIVE_SOURCES });
+      assert.deepEqual(sorted(listed.map((i) => i.id)), IN_SCOPE);
+      assert.equal((await repo.listArchiveItems(OWNER, { sources: MAIN_ARCHIVE_SOURCES, order: "recent" })).length, 5);
+      // Without a filter every item is still listed, and liked records stay attached and stored.
+      assert.equal((await repo.listArchiveItems(OWNER)).length, 6);
+      assert.deepEqual((await repo.getArchiveItemAggregate(item("likedSaved")))?.sources.map((s) => s.source).sort(), ["liked", "saved"]);
+      assert.ok(await repo.getArchiveItemAggregate(item("likedOnly")));
+    });
+
+    test("AI enrichment candidates with MAIN_ARCHIVE_SOURCES exclude liked-only items", async () => {
+      const candidates = await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES });
+      assert.deepEqual(sorted(candidates.map((c) => c.itemId)), IN_SCOPE);
+      assert.equal((await repo.listAiEnrichmentCandidates(OWNER)).length, 6); // unfiltered
+    });
+
+    test("the domain rule agrees with the query, and unknown source kinds are refused", async () => {
+      for (const [name, kinds] of Object.entries(COMBOS)) {
+        assert.equal(isInMainArchive(kinds.map((source) => ({ source }))), IN_SCOPE.includes(item(name)), name);
+      }
+      await assert.rejects(repo.listArchiveItems(OWNER, { sources: ["saved'); DROP TABLE x; --" as SourceRecord["source"]] }), /Unknown source kind/);
+      assert.deepEqual(await repo.listArchiveItems(OWNER, { sources: [] }), []);
+    });
   });
 });
 

@@ -355,18 +355,23 @@ describe("runEnrichmentBatch", () => {
     const second = await batch({ limit: 10 });
     const enrichedFirst = first.results.filter((r) => r.status === "enriched").map((r) => r.itemId);
     assert.ok(second.results.every((r) => !enrichedFirst.includes(r.itemId)), "enriched items are not picked again");
-    // Every classifiable fixture item is now enriched; the two with neither caption nor
-    // media (BareDDD444, ReplyEEE555) are never selected.
+    // Every classifiable fixture item in the main archive is now enriched. Never selected:
+    // the two with neither caption nor media (BareDDD444, ReplyEEE555) and the liked-only
+    // PostCCC333 (outside the main archive).
     const left = await runEnrichmentBatch({ service: service(), repository: repo, ownerId: OWNER, limit: 10 });
     assert.equal(left.attempted, 0);
-    assert.equal(first.enriched + second.enriched, 3);
+    assert.equal(first.enriched + second.enriched, 2);
+    assert.ok(![...first.results, ...second.results].some((r) => r.itemId === id("PostCCC333")));
     assert.equal(first.inputTokens + second.inputTokens, 100 * (first.enriched + second.enriched));
   });
 
   test("named items are processed in the given order, capped at the limit", async () => {
-    const summary = await batch({ shortcodes: ["CarouBBB222", "PostCCC333", "ReelAAA111"] });
-    assert.deepEqual(summary.results.map((r) => r.itemId), [id("CarouBBB222"), id("PostCCC333")]);
+    const summary = await batch({ shortcodes: ["ReelAAA111", "CarouBBB222", "BareDDD444"] });
+    assert.deepEqual(summary.results.map((r) => r.itemId), [id("ReelAAA111"), id("CarouBBB222")]);
     await assert.rejects(batch({ shortcodes: ["NoSuchPost"] }), /No archive item for shortcode NoSuchPost/);
+    // A liked-only item is outside the main archive, even when named.
+    await assert.rejects(batch({ shortcodes: ["PostCCC333"] }), /PostCCC333 is not in the main archive/);
+    assert.equal(provider.requests.length, 2);
   });
 
   test("missing or rejected credentials stop the batch", async () => {

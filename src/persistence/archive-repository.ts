@@ -1,3 +1,4 @@
+import type { SearchField } from "../search/search-query.ts";
 import type {
   AiOrganization,
   ArchiveItem,
@@ -7,6 +8,7 @@ import type {
   InstagramIdentity,
   MediaAsset,
   OriginalMetadata,
+  SourceKind,
   SourceRecord,
   UserId,
 } from "../domain/archive-item.ts";
@@ -98,18 +100,55 @@ export interface ArchiveRepository {
   /**
    * Items of an owner with no AI organization yet, newest first (latest
    * save/like/DM date), with what enrichment needs to choose among them.
+   * With `sources`, only items with at least one source record of those kinds.
    */
-  listAiEnrichmentCandidates(ownerId: UserId): Promise<AiEnrichmentCandidate[]>;
+  listAiEnrichmentCandidates(
+    ownerId: UserId,
+    options?: { sources?: readonly SourceKind[] },
+  ): Promise<AiEnrichmentCandidate[]>;
+
+  /**
+   * Keyword search over the creator, caption and the item's organization
+   * (the curated one if reviewed, else the latest AI suggestion): type,
+   * category, tags, summary and usefulFor. Case-insensitive; terms match the
+   * start of words (see parseSearchQuery). Ranking, in order: how many
+   * distinct terms the organization matches (what the item is about), how
+   * many match anywhere (caption and creator included), the weighted field
+   * score, then most recent.
+   * Only items with a source record of one of `sources` are searched.
+   * An empty query matches nothing.
+   */
+  searchArchiveItems(
+    ownerId: UserId,
+    query: string,
+    options: { sources: readonly SourceKind[]; limit?: number; offset?: number },
+  ): Promise<{ total: number; hits: ArchiveSearchHit[] }>;
 
   /** Number of retrieval requests per status. */
   countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>>;
 
-  /** Newest first (createdAt, then id). */
+  /**
+   * Newest first: by `createdAt` (default), or with `order: "recent"` by the
+   * latest save/like/DM date (items without one last). Ties by id.
+   * With `sources`, only items with at least one source record of those
+   * kinds (e.g. MAIN_ARCHIVE_SOURCES for the main archive).
+   */
   listArchiveItems(
     ownerId: UserId,
-    page?: { limit?: number; offset?: number },
+    page?: { limit?: number; offset?: number; order?: "created" | "recent"; sources?: readonly SourceKind[] },
   ): Promise<ArchiveItem[]>;
 }
+
+export type ArchiveSearchHit = {
+  item: ArchiveItem;
+  /** Weighted sum of term matches per field (see SEARCH_FIELD_WEIGHTS). */
+  score: number;
+  /** How many distinct query terms matched somewhere. */
+  matchedTerms: number;
+  /** How many distinct query terms matched the item's organization (ORGANIZATION_SEARCH_FIELDS). */
+  organizationTerms: number;
+  matchedFields: SearchField[];
+};
 
 export type AiEnrichmentCandidate = {
   itemId: ArchiveItemId;

@@ -41,6 +41,7 @@ npm run import:instagram -- /path/to/instagram-export --owner-sender-name "Your 
 ```
 
 - **What it reads:** Liked, Saved and every Messages thread. Other files are ignored. No media is downloaded and no AI is called.
+- **Scope:** Main archive scope: Saved + Messages. Likes are preserved as imported source data but are not included in the main archive. Liked-only items are imported and kept, but the archive UI and AI enrichment leave them out.
 - **Where it writes:** the database at `DATABASE_PATH` (from `.env.local`); `--database <path>` overrides it.
 - **All or nothing:** the whole export is written in one transaction, so a failed import writes nothing.
 - **Safe to re-run:** posts and source records are never duplicated. A later export only adds information.

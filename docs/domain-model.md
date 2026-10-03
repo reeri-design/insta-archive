@@ -35,6 +35,11 @@ Message sources also carry `MessageContext`. It includes `userNote`, which holds
 
 ## Key decisions
 
+- **Main archive scope: Saved + Messages. Likes are preserved as imported source data but are not included in the main archive.**
+  - An item is in the main archive when at least one of its SourceRecords is `saved` or `messages`. An item that was liked *and* saved or shared stays in, and its liked record stays attached and visible.
+  - Liked-only items are imported and stored like any other item. Their records are never deleted, so Likes can become an optional source later. They are simply left out of the product: the archive UI, AI enrichment selection and, later, search.
+  - Defined once in `src/domain/archive-scope.ts` (`MAIN_ARCHIVE_SOURCES`, `isInMainArchive`). Repository list queries take a `sources` option, so the filtering happens in SQL rather than in the UI.
+
 - **Deduplication:** items are keyed by `(ownerId, identity)`. `identity` is the Instagram shortcode, which is shared across `/p/`, `/reel/` and `/tv/` URLs. If no shortcode can be extracted, a normalized URL is used instead. A post that was saved, liked and sent in DMs becomes one item with three SourceRecords, and each record keeps its own URL and timestamp.
 - **Carousel and reel are one item each.** A carousel is one item with ordered `content` assets. A reel is one item with one `content` video plus any number of `derived_frame` assets.
 - **`kind: "unknown"` is valid.** The export often gives only a URL. The kind can be refined later, for example once retrieval shows a post is a carousel.

@@ -22,9 +22,17 @@ import type {
 } from "../../domain/archive-item.ts";
 import type { MediaRetrievalRequest } from "../../domain/media-retrieval.ts";
 import {
+  normalizeSearchText,
+  ORGANIZATION_SEARCH_FIELDS,
+  parseSearchQuery,
+  SEARCH_FIELD_WEIGHTS,
+  type SearchField,
+} from "../../search/search-query.ts";
+import {
   ArchiveIdentityConflictError,
   PersistenceIntegrityError,
   type AiEnrichmentCandidate,
+  type ArchiveSearchHit,
   type ArchiveRepository,
 } from "../archive-repository.ts";
 
@@ -42,6 +50,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   constructor(db: DatabaseSync) {
     this.db = db;
+    // Unicode-aware normalization for search (SQLite's lower() is ASCII-only).
+    db.function("search_norm", { deterministic: true }, (value) =>
+      normalizeSearchText(typeof value === "string" ? value : null),
+    );
   }
 
   async withTransaction<T>(work: (repo: ArchiveRepository) => Promise<T>): Promise<T> {
@@ -354,7 +366,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return rows.map(toRequest);
   }
 
-  async listAiEnrichmentCandidates(ownerId: UserId): Promise<AiEnrichmentCandidate[]> {
+  async listAiEnrichmentCandidates(
+    ownerId: UserId,
+    options: { sources?: readonly SourceKind[] } = {},
+  ): Promise<AiEnrichmentCandidate[]> {
     const rows = this.db
       .prepare(
         `SELECT i.id, i.kind,
@@ -367,6 +382,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            EXISTS (SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored') AS has_media
          FROM archive_items i
          WHERE i.owner_id = ? AND NOT EXISTS (SELECT 1 FROM ai_organizations o WHERE o.archive_item_id = i.id)
+           ${sourceFilter("i.id", options.sources)}
          ORDER BY latest_at DESC NULLS LAST, i.id`,
       )
       .all(ownerId) as {
@@ -382,6 +398,82 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       hasCaption: r.has_caption === 1,
       hasStoredMedia: r.has_media === 1,
     }));
+  }
+
+  async searchArchiveItems(
+    ownerId: UserId,
+    query: string,
+    options: { sources: readonly SourceKind[]; limit?: number; offset?: number },
+  ): Promise<{ total: number; hits: ArchiveSearchHit[] }> {
+    const terms = parseSearchQuery(query);
+    if (terms.length === 0) return { total: 0, hits: [] };
+
+    const fields = Object.keys(SEARCH_FIELD_WEIGHTS) as SearchField[];
+    const params: Record<string, string> = { owner_id: ownerId };
+    // matches(field, term): the term starts a word in the field (or occurs anywhere, for CJK terms).
+    const matches = (field: SearchField, i: number) =>
+      terms[i]?.anywhere ? `(instr(d.${field}, :t${i}) > 0)` : `(instr(' ' || d.${field}, ' ' || :t${i}) > 0)`;
+    terms.forEach((term, i) => (params[`t${i}`] = term.text));
+    const anyOf = (searched: readonly SearchField[], i: number) => `(${searched.map((f) => matches(f, i)).join(" OR ")})`;
+    const score = terms
+      .flatMap((_, i) => fields.map((f) => `${SEARCH_FIELD_WEIGHTS[f]} * ${matches(f, i)}`))
+      .join(" + ");
+    const matchedTerms = terms.map((_, i) => anyOf(fields, i)).join(" + ");
+    const organizationTerms = terms.map((_, i) => anyOf(ORGANIZATION_SEARCH_FIELDS, i)).join(" + ");
+    const fieldHits = fields.map((f) => `(${terms.map((_, i) => matches(f, i)).join(" OR ")}) AS hit_${f}`).join(", ");
+
+    const rows = this.db
+      .prepare(
+        `WITH scoped AS (
+           SELECT i.id,
+             -- The item's organization: the curated one if reviewed, else the newest AI suggestion.
+             COALESCE(c.fields_json, (SELECT a.fields_json FROM ai_organizations a WHERE a.archive_item_id = i.id
+                                       ORDER BY a.created_at DESC, a.id DESC LIMIT 1)) AS org
+           FROM archive_items i
+           LEFT JOIN curated_organizations c ON c.archive_item_id = i.id
+           WHERE i.owner_id = :owner_id ${sourceFilter("i.id", options.sources)}
+         ),
+         -- Materialized so each field is normalized once per item, not once per term.
+         docs AS MATERIALIZED (
+           SELECT s.id,
+             search_norm((SELECT coalesce(json_extract(m.value_json, '$.username'), '') || ' ' ||
+                                 coalesce(json_extract(m.value_json, '$.displayName'), '')
+                          FROM original_metadata m WHERE m.archive_item_id = s.id AND m.field = 'creator')) AS creator,
+             search_norm((SELECT json_extract(m.value_json, '$')
+                          FROM original_metadata m WHERE m.archive_item_id = s.id AND m.field = 'caption')) AS caption,
+             search_norm(json_extract(s.org, '$.type')) AS type,
+             search_norm(json_extract(s.org, '$.category')) AS category,
+             search_norm(json_extract(s.org, '$.summary')) AS summary,
+             search_norm(json_extract(s.org, '$.tags')) AS tags,
+             search_norm(json_extract(s.org, '$.usefulFor')) AS usefulFor
+           FROM scoped s
+         ),
+         scored AS (
+           SELECT d.id, ${organizationTerms} AS organization_terms, ${matchedTerms} AS matched_terms,
+             ${score} AS score, ${fieldHits},
+             (SELECT MAX(occurred_at) FROM source_records r WHERE r.archive_item_id = d.id) AS latest_at
+           FROM docs d
+         )
+         SELECT * FROM scored WHERE matched_terms > 0
+         ORDER BY organization_terms DESC, matched_terms DESC, score DESC, latest_at DESC NULLS LAST, id`,
+      )
+      .all(params) as ({ id: string; organization_terms: number; matched_terms: number; score: number } & Record<string, unknown>)[];
+
+    const offset = options.offset ?? 0;
+    const page = rows.slice(offset, offset + (options.limit ?? 100));
+    const hits: ArchiveSearchHit[] = [];
+    for (const row of page) {
+      const item = await this.getArchiveItem(row.id as ArchiveItemId);
+      if (!item) continue;
+      hits.push({
+        item,
+        score: row.score,
+        matchedTerms: row.matched_terms,
+        organizationTerms: row.organization_terms,
+        matchedFields: fields.filter((f) => row[`hit_${f}`] === 1),
+      });
+    }
+    return { total: rows.length, hits };
   }
 
   async countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>> {
@@ -466,12 +558,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   async listArchiveItems(
     ownerId: UserId,
-    page: { limit?: number; offset?: number } = {},
+    page: { limit?: number; offset?: number; order?: "created" | "recent"; sources?: readonly SourceKind[] } = {},
   ): Promise<ArchiveItem[]> {
+    const orderBy = page.order === "recent"
+      ? `(SELECT MAX(occurred_at) FROM source_records s WHERE s.archive_item_id = archive_items.id) DESC NULLS LAST, id`
+      : "created_at DESC, id";
     const rows = this.db
       .prepare(
         `SELECT * FROM archive_items WHERE owner_id = :owner_id
-         ORDER BY created_at DESC, id LIMIT :limit OFFSET :offset`,
+           ${sourceFilter("archive_items.id", page.sources)}
+         ORDER BY ${orderBy} LIMIT :limit OFFSET :offset`,
       )
       .all({ owner_id: ownerId, limit: page.limit ?? 100, offset: page.offset ?? 0 }) as ItemRow[];
     return rows.map((row) => this.toItem(row));
@@ -741,4 +837,21 @@ function jsonOrNull(value: unknown): string | null {
 
 function isConstraint(error: unknown, messagePrefix: string): boolean {
   return error instanceof Error && error.message.startsWith(messagePrefix);
+}
+
+const SOURCE_KINDS: readonly SourceKind[] = ["messages", "saved", "liked"];
+
+/**
+ * "AND the item has a source record of one of these kinds", or nothing when
+ * no kinds are given. Kinds are checked against the known set before being
+ * written into the SQL.
+ */
+function sourceFilter(itemIdColumn: string, sources: readonly SourceKind[] | undefined): string {
+  if (!sources) return "";
+  for (const kind of sources) {
+    if (!SOURCE_KINDS.includes(kind)) throw new Error(`Unknown source kind: ${String(kind)}`);
+  }
+  if (sources.length === 0) return "AND 0";
+  const list = sources.map((kind) => `'${kind}'`).join(", ");
+  return `AND EXISTS (SELECT 1 FROM source_records sf WHERE sf.archive_item_id = ${itemIdColumn} AND sf.source IN (${list}))`;
 }
