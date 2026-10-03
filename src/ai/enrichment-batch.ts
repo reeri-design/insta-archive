@@ -99,17 +99,27 @@ export async function selectItemsForEnrichment(
 }
 
 /**
- * Deterministic, varied sample: items are grouped by content kind and source
+ * Deterministic, varied sample. Items with stored media come first, so the
+ * media-aware path is exercised; metadata-only items fill the rest of the
+ * limit. Within each tier, items are grouped by content kind and source
  * context (e.g. "reel | liked", "carousel | messages+saved"), groups are
  * visited round-robin (largest first), and within a group the newest item by
- * a creator not yet picked comes first. Items with neither a caption nor
- * stored media are left out: there is nothing to classify without guessing.
- * Candidates are expected newest first.
+ * a creator not yet picked (in either tier) comes first. Items with neither a
+ * caption nor stored media are left out: there is nothing to classify without
+ * guessing. Candidates are expected newest first.
  */
 export function representativeSample(candidates: AiEnrichmentCandidate[], limit: number): ArchiveItemId[] {
+  const picked: ArchiveItemId[] = [];
+  const creators = new Set<string>();
+  pickRoundRobin(candidates.filter((c) => c.hasStoredMedia), limit, picked, creators);
+  pickRoundRobin(candidates.filter((c) => !c.hasStoredMedia && c.hasCaption), limit, picked, creators);
+  return picked;
+}
+
+/** Adds candidates to `picked` round-robin over kind/source groups, up to `limit` in total. */
+function pickRoundRobin(candidates: AiEnrichmentCandidate[], limit: number, picked: ArchiveItemId[], creators: Set<string>): void {
   const groups = new Map<string, AiEnrichmentCandidate[]>();
   for (const candidate of candidates) {
-    if (!candidate.hasCaption && !candidate.hasStoredMedia) continue;
     const key = `${candidate.kind} | ${candidate.sources.join("+")}`;
     const group = groups.get(key);
     if (group) group.push(candidate);
@@ -119,8 +129,6 @@ export function representativeSample(candidates: AiEnrichmentCandidate[], limit:
     .sort(([ka, a], [kb, b]) => b.length - a.length || (ka < kb ? -1 : ka > kb ? 1 : 0))
     .map(([, group]) => group);
 
-  const picked: ArchiveItemId[] = [];
-  const creators = new Set<string>();
   while (picked.length < limit && ordered.some((g) => g.length > 0)) {
     for (const group of ordered) {
       if (picked.length >= limit || group.length === 0) continue;
@@ -131,5 +139,4 @@ export function representativeSample(candidates: AiEnrichmentCandidate[], limit:
       if (choice.creatorUsername) creators.add(choice.creatorUsername);
     }
   }
-  return picked;
 }

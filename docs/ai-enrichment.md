@@ -68,7 +68,7 @@ npm run enrich:ai -- --limit 3 --item <shortcode> …  # specific items
 ```
 
 - **Limits:** `--limit` is required (1–100), so a run can never cover the whole archive.
-- **Selection:** without `--item`, items are chosen deterministically for variety. Groups are built from content kind × source context (e.g. "reel | liked") and visited in turn, newest item first, preferring creators not yet picked. Items with neither a caption nor stored media are never chosen.
+- **Selection:** without `--item`, items are chosen deterministically for variety. Items with stored media are chosen first, so the media-aware path gets exercised; metadata-only items fill the rest of the limit. Within each of these two tiers, groups are built from content kind × source context (e.g. "reel | liked") and visited in turn, newest item first, preferring creators not yet picked. Items with neither a caption nor stored media are never chosen.
 - **Preview:** `--dry-run` lists the items a run would enrich, without any AI calls.
 - **Pacing:** items are processed one at a time with a pause between them (`--delay-ms`, default 1000).
 - **Stopping:** the batch stops early on a rate limit or on missing/invalid credentials. Other failures (refusals, invalid output, provider errors) are reported and save nothing.

@@ -315,6 +315,27 @@ describe("representative selection", () => {
     assert.equal(representativeSample(candidates, 50).length, 7);
     assert.ok(!representativeSample(candidates, 50).includes("i8" as ArchiveItemId));
   });
+
+  test("items with stored media are selected before metadata-only items, still spread across groups and creators", () => {
+    const c = (n: number, kind: "reel" | "carousel" | "post", sources: ("liked" | "saved" | "messages")[], creator: string, media: boolean, hasCaption = true) => ({
+      itemId: `i${n}` as ArchiveItemId, kind, sources, creatorUsername: creator, hasCaption, hasStoredMedia: media,
+    });
+    const candidates = [ // newest first; the media items are deliberately the older ones
+      c(1, "reel", ["liked"], "ann", false), c(2, "carousel", ["messages"], "bob", false), c(3, "post", ["saved"], "cat", false),
+      c(4, "reel", ["liked"], "dan", true), c(5, "reel", ["liked"], "dan", true), c(6, "reel", ["liked"], "eve", true),
+      c(7, "carousel", ["messages"], "fay", true, false), // media but no caption: still eligible
+      c(8, "post", ["saved"], "gus", false, false), // neither: never chosen
+    ];
+    // Media tier first (round-robin: reel group, then carousel group; dan's second item after eve's).
+    assert.deepEqual(representativeSample(candidates, 3), ["i4", "i7", "i6"]);
+    // The rest of the limit is filled with metadata-only items, in the usual group order (equal sizes: by key).
+    assert.deepEqual(representativeSample(candidates, 6), ["i4", "i7", "i6", "i5", "i2", "i3"]);
+    const all = representativeSample(candidates, 50);
+    assert.deepEqual(all, ["i4", "i7", "i6", "i5", "i2", "i3", "i1"]);
+    // No metadata-only item comes before a media item.
+    const withMedia = new Set(["i4", "i5", "i6", "i7"]);
+    assert.ok(all.slice(0, 4).every((i) => withMedia.has(i)));
+  });
 });
 
 describe("runEnrichmentBatch", () => {
