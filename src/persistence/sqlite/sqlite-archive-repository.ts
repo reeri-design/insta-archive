@@ -24,6 +24,7 @@ import type { MediaRetrievalRequest } from "../../domain/media-retrieval.ts";
 import {
   ArchiveIdentityConflictError,
   PersistenceIntegrityError,
+  type AiEnrichmentCandidate,
   type ArchiveRepository,
 } from "../archive-repository.ts";
 
@@ -351,6 +352,36 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       )
       .all({ now, limit, owner_id: options.ownerId ?? null, max_priority: options.maxPriority ?? null }) as RequestRow[];
     return rows.map(toRequest);
+  }
+
+  async listAiEnrichmentCandidates(ownerId: UserId): Promise<AiEnrichmentCandidate[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT i.id, i.kind,
+           (SELECT group_concat(source) FROM
+              (SELECT DISTINCT source FROM source_records s WHERE s.archive_item_id = i.id ORDER BY source)) AS sources,
+           (SELECT MAX(occurred_at) FROM source_records s WHERE s.archive_item_id = i.id) AS latest_at,
+           (SELECT json_extract(value_json, '$.username') FROM original_metadata m
+              WHERE m.archive_item_id = i.id AND m.field = 'creator') AS creator,
+           EXISTS (SELECT 1 FROM original_metadata m WHERE m.archive_item_id = i.id AND m.field = 'caption') AS has_caption,
+           EXISTS (SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored') AS has_media
+         FROM archive_items i
+         WHERE i.owner_id = ? AND NOT EXISTS (SELECT 1 FROM ai_organizations o WHERE o.archive_item_id = i.id)
+         ORDER BY latest_at DESC NULLS LAST, i.id`,
+      )
+      .all(ownerId) as {
+        id: string; kind: ArchiveItemKind; sources: string | null; latest_at: string | null;
+        creator: string | null; has_caption: number; has_media: number;
+      }[];
+    return rows.map((r) => ({
+      itemId: r.id as ArchiveItemId,
+      kind: r.kind,
+      sources: (r.sources ? r.sources.split(",") : []) as SourceKind[],
+      ...(r.latest_at !== null && { latestAt: r.latest_at }),
+      ...(r.creator !== null && { creatorUsername: r.creator }),
+      hasCaption: r.has_caption === 1,
+      hasStoredMedia: r.has_media === 1,
+    }));
   }
 
   async countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>> {

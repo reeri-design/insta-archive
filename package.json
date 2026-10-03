@@ -12,9 +12,12 @@
     "test": "node --test \"src/**/*.test.ts\"",
     "import:instagram": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/import-instagram-export.ts",
     "retrieve:media": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/retrieve-media.ts",
+    "enrich:ai": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/enrich-ai.ts",
     "spike:instagram-image": "node --env-file-if-exists=.env.local --disable-warning=ExperimentalWarning src/cli/instagram-image-spike.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "@google/genai": "^2.27.0",
     "next": "16.3.8",
     "react": "19.2.8",
     "react-dom": "19.2.8"

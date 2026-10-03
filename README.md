@@ -17,7 +17,7 @@ Next.js (App Router) and strict TypeScript. SQLite for metadata and the local fi
 
 ## Status
 
-An Instagram export can be imported into the SQLite archive. Media can be retrieved in controlled, resumable batches (single images, carousels, and Reels as video or sampled frames). There is no AI, search or archive UI yet.
+An Instagram export can be imported into the SQLite archive. Media can be retrieved in controlled, resumable batches (single images, carousels, and Reels as video or sampled frames). AI enrichment exists as a small-batch experiment. There is no search or archive UI yet.
 
 ## Development
 
@@ -58,5 +58,13 @@ npm run retrieve:media -- --limit 20
 ```
 
 It is resumable and stops on a rate limit. See `docs/media-retrieval.md` ("Running a retrieval batch").
+
+## AI enrichment (experimental)
+
+```bash
+npm run enrich:ai -- --limit 10
+```
+
+This suggests a type, category, tags, summary and uses for each item. It runs only on small, explicit batches and needs `GEMINI_API_KEY` in `.env.local` (or `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY`). See `docs/ai-enrichment.md`.
 
 Requires Node.js 22.13 or later (built-in `node:sqlite`); `npm test` needs 22.18 or later (native TypeScript).

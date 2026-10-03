@@ -95,6 +95,12 @@ export interface ArchiveRepository {
     options?: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest" },
   ): Promise<MediaRetrievalRequest[]>;
 
+  /**
+   * Items of an owner with no AI organization yet, newest first (latest
+   * save/like/DM date), with what enrichment needs to choose among them.
+   */
+  listAiEnrichmentCandidates(ownerId: UserId): Promise<AiEnrichmentCandidate[]>;
+
   /** Number of retrieval requests per status. */
   countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>>;
 
@@ -104,6 +110,17 @@ export interface ArchiveRepository {
     page?: { limit?: number; offset?: number },
   ): Promise<ArchiveItem[]>;
 }
+
+export type AiEnrichmentCandidate = {
+  itemId: ArchiveItemId;
+  kind: ArchiveItem["kind"];
+  /** Distinct source kinds, sorted (e.g. ["liked", "messages"]). */
+  sources: SourceRecord["source"][];
+  latestAt?: string;
+  creatorUsername?: string;
+  hasCaption: boolean;
+  hasStoredMedia: boolean;
+};
 
 /** Another item already holds this (ownerId, identity). */
 export class ArchiveIdentityConflictError extends Error {

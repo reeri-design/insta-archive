@@ -1,0 +1,135 @@
+/**
+ * A small, explicit enrichment batch: a fixed limit, a deterministic choice of
+ * items (or the ones named), one call at a time, stopping on a rate limit.
+ */
+import type { ArchiveItemId, UserId } from "../domain/archive-item.ts";
+import type { AiEnrichmentCandidate, ArchiveRepository } from "../persistence/archive-repository.ts";
+import type { AiEnrichmentService, EnrichmentResult } from "./enrichment-service.ts";
+
+/** Hard ceiling per run, so a batch can never cover the whole archive by accident. */
+export const MAX_ENRICHMENT_LIMIT = 100;
+
+export type EnrichmentBatchSummary = {
+  attempted: number;
+  enriched: number;
+  skipped: number;
+  failed: number;
+  rateLimited: boolean;
+  /** Stopped because the provider rejected or lacked credentials. */
+  stoppedForAuthentication: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  results: EnrichmentResult[];
+};
+
+export type EnrichmentBatchOptions = {
+  service: Pick<AiEnrichmentService, "enrich">;
+  repository: ArchiveRepository;
+  ownerId: UserId;
+  limit: number;
+  /** Specific items to enrich (by Instagram shortcode); otherwise a representative sample. */
+  shortcodes?: string[];
+  delayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  onResult?: (result: EnrichmentResult) => void;
+};
+
+export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promise<EnrichmentBatchSummary> {
+  const { limit } = options;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ENRICHMENT_LIMIT) {
+    throw new Error(`limit must be an integer from 1 to ${MAX_ENRICHMENT_LIMIT}`);
+  }
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const itemIds = await selectItemsForEnrichment(options);
+
+  const summary: EnrichmentBatchSummary = {
+    attempted: 0, enriched: 0, skipped: 0, failed: 0, rateLimited: false, stoppedForAuthentication: false, inputTokens: 0, outputTokens: 0, results: [],
+  };
+  for (const [index, itemId] of itemIds.entries()) {
+    if (index > 0 && options.delayMs) await sleep(options.delayMs);
+    let result: EnrichmentResult;
+    try {
+      result = await options.service.enrich(itemId);
+    } catch (error) {
+      result = { status: "failed", itemId, kind: "provider_error", reason: error instanceof Error ? error.message : String(error) };
+    }
+    summary.attempted++;
+    summary.results.push(result);
+    options.onResult?.(result);
+    if (result.status === "enriched") {
+      summary.enriched++;
+      summary.inputTokens += result.usage?.inputTokens ?? 0;
+      summary.outputTokens += result.usage?.outputTokens ?? 0;
+    } else if (result.status === "skipped") {
+      summary.skipped++;
+    } else {
+      summary.failed++;
+      if (result.kind === "rate_limited") {
+        summary.rateLimited = true;
+        break;
+      }
+      // Every further call would fail the same way.
+      if (result.kind === "authentication") {
+        summary.stoppedForAuthentication = true;
+        break;
+      }
+    }
+  }
+  return summary;
+}
+
+/**
+ * The items a batch will process: the named ones (first `limit`), or a
+ * representative sample of items without an AI organization.
+ */
+export async function selectItemsForEnrichment(
+  options: Pick<EnrichmentBatchOptions, "repository" | "ownerId" | "limit" | "shortcodes">,
+): Promise<ArchiveItemId[]> {
+  const { repository, ownerId, limit } = options;
+  if (options.shortcodes && options.shortcodes.length > 0) {
+    const ids: ArchiveItemId[] = [];
+    for (const shortcode of options.shortcodes.slice(0, limit)) {
+      const item = await repository.findArchiveItemByIdentity(ownerId, { kind: "shortcode", shortcode });
+      if (!item) throw new Error(`No archive item for shortcode ${shortcode}`);
+      ids.push(item.id);
+    }
+    return ids;
+  }
+  return representativeSample(await repository.listAiEnrichmentCandidates(ownerId), limit);
+}
+
+/**
+ * Deterministic, varied sample: items are grouped by content kind and source
+ * context (e.g. "reel | liked", "carousel | messages+saved"), groups are
+ * visited round-robin (largest first), and within a group the newest item by
+ * a creator not yet picked comes first. Items with neither a caption nor
+ * stored media are left out: there is nothing to classify without guessing.
+ * Candidates are expected newest first.
+ */
+export function representativeSample(candidates: AiEnrichmentCandidate[], limit: number): ArchiveItemId[] {
+  const groups = new Map<string, AiEnrichmentCandidate[]>();
+  for (const candidate of candidates) {
+    if (!candidate.hasCaption && !candidate.hasStoredMedia) continue;
+    const key = `${candidate.kind} | ${candidate.sources.join("+")}`;
+    const group = groups.get(key);
+    if (group) group.push(candidate);
+    else groups.set(key, [candidate]);
+  }
+  const ordered = [...groups.entries()]
+    .sort(([ka, a], [kb, b]) => b.length - a.length || (ka < kb ? -1 : ka > kb ? 1 : 0))
+    .map(([, group]) => group);
+
+  const picked: ArchiveItemId[] = [];
+  const creators = new Set<string>();
+  while (picked.length < limit && ordered.some((g) => g.length > 0)) {
+    for (const group of ordered) {
+      if (picked.length >= limit || group.length === 0) continue;
+      const fresh = group.findIndex((c) => !c.creatorUsername || !creators.has(c.creatorUsername));
+      const [choice] = group.splice(fresh === -1 ? 0 : fresh, 1);
+      if (!choice) continue;
+      picked.push(choice.itemId);
+      if (choice.creatorUsername) creators.add(choice.creatorUsername);
+    }
+  }
+  return picked;
+}
