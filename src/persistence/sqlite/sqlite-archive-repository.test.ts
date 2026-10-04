@@ -576,6 +576,62 @@ describe("database", () => {
     }
   });
 
+  test("migration 4 keeps existing media and allows one cover image per item", () => {
+    // A database at version 3 with a video, a linked frame and a frames-only frame.
+    const v3 = new DatabaseSync(":memory:");
+    v3.exec("PRAGMA foreign_keys = ON");
+    for (const sql of MIGRATIONS.slice(0, 3)) v3.exec(sql);
+    v3.exec("PRAGMA user_version = 3");
+    v3.exec(`INSERT INTO archive_items VALUES ('i1', 'o1', 'shortcode', 'R1', 'reel', 'u', '${T0}', '${T0}')`);
+    v3.exec(`INSERT INTO archive_items VALUES ('i2', 'o1', 'shortcode', 'R2', 'reel', 'u', '${T0}', '${T0}')`);
+    const stored = (key: string) => JSON.stringify({ status: "stored", storageKey: key, mimeType: "x", retrievedAt: T0 });
+    v3.prepare("INSERT INTO media_assets VALUES ('v', 'i1', 'content', 'video', 0, NULL, NULL, 'stored', ?)").run(stored("v.mp4"));
+    v3.prepare("INSERT INTO media_assets VALUES ('f', 'i1', 'derived_frame', 'image', NULL, 'v', 500, 'stored', ?)").run(stored("f.jpg"));
+    v3.prepare("INSERT INTO media_assets VALUES ('g', 'i2', 'derived_frame', 'image', NULL, NULL, 0, 'stored', ?)").run(stored("g.jpg"));
+    assert.throws(
+      () => v3.prepare("INSERT INTO media_assets VALUES ('c', 'i1', 'cover', 'image', NULL, NULL, NULL, 'stored', ?)").run(stored("c.jpg")),
+      /CHECK constraint failed/,
+    );
+    const before = v3.prepare("SELECT * FROM media_assets ORDER BY id").all();
+
+    migrate(v3);
+    assert.equal((v3.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, MIGRATIONS.length);
+    assert.deepEqual(v3.prepare("SELECT * FROM media_assets ORDER BY id").all(), before);
+    assert.deepEqual(v3.prepare("PRAGMA foreign_key_check").all(), []);
+
+    const insert = (id: string, item: string, type: string, position: number | null, frame: number | null) =>
+      v3.prepare("INSERT INTO media_assets VALUES (?, ?, 'cover', ?, ?, NULL, ?, 'stored', ?)").run(id, item, type, position, frame, stored(`${id}.jpg`));
+    insert("c1", "i1", "image", null, null);
+    insert("c2", "i2", "image", null, null); // one per item, for any item
+    assert.throws(() => insert("c3", "i1", "image", null, null), /UNIQUE constraint failed/);
+    assert.throws(() => insert("c4", "i2", "video", null, null), /CHECK constraint failed/); // always an image
+    assert.throws(() => insert("c5", "i2", "image", 0, null), /CHECK constraint failed/); // no position
+    assert.throws(() => insert("c6", "i2", "image", null, 0), /CHECK constraint failed/); // no frame time
+    // Existing rules still hold.
+    assert.throws(
+      () => v3.prepare("INSERT INTO media_assets VALUES ('x', 'i1', 'content', 'image', 0, NULL, NULL, 'stored', ?)").run(stored("x.jpg")),
+      /UNIQUE constraint failed/,
+    );
+    v3.close();
+  });
+
+  test("a cover image asset round-trips through the repository", async () => {
+    const itemId = "owner-1:shortcode:ReelAAA111" as ArchiveItemId;
+    await repo.saveArchiveItem(makeItem());
+    await repo.addSourceRecords([makeSource("cover-src", itemId)]);
+    const cover: MediaAsset = {
+      id: `${itemId}:cover` as MediaAssetId, archiveItemId: itemId, mediaType: "image", role: "cover",
+      retrieval: { status: "stored", storageKey: "k/cover.jpg", mimeType: "image/jpeg", retrievedAt: T0, width: 640, height: 1136 },
+    };
+    const withheld: MediaAsset = {
+      id: `${itemId}:media:0` as MediaAssetId, archiveItemId: itemId, mediaType: "video", role: "content", position: 0,
+      retrieval: { status: "unavailable", checkedAt: T0, reason: "restricted", detail: "Embed page has no video URL" },
+    };
+    await repo.saveMediaAssets([cover, withheld]);
+    const media = (await repo.getArchiveItemAggregate(itemId))?.media ?? [];
+    assert.deepEqual([...media].sort((a, b) => a.id.localeCompare(b.id)), [cover, withheld]);
+  });
+
   test("migration 3 keeps existing media and lets frames exist without a video", () => {
     // A database at version 2 (before the change) with a video and a linked frame.
     const v2 = new DatabaseSync(":memory:");

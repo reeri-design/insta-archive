@@ -191,6 +191,67 @@ describe("Reel media strategy", () => {
     existsSync(join(dir, "media")) ? readdirSync(join(dir, "media"), { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name) : [];
   const media = async () => (await repo.getArchiveItemAggregate(ITEM_ID))?.media ?? [];
 
+  describe("video withheld: cover image fallback", () => {
+    const POSTER = "https://cdn.example.test/o1/cover.jpg?oh=sig";
+    const COVER = new TextEncoder().encode("jpeg cover bytes");
+    const withheldEmbed = (withCover: boolean) => {
+      const media = {
+        __typename: "GraphVideo", is_video: true, product_type: "clips", video_duration: 9.4, dimensions: { width: 720, height: 1280 },
+        ...(withCover && { display_url: POSTER, display_resources: [{ src: POSTER, config_width: 720, config_height: 1280 }] }),
+      };
+      const json = JSON.stringify(JSON.stringify({ gql_data: { shortcode_media: media } }));
+      return `<div class="Embed" data-media-type="GraphVideo"></div><script>x({"contextJSON":${json}})</script>`;
+    };
+    const routes = (cover: () => Response, withCover = true) => ({
+      [EMBED]: () => new Response(withheldEmbed(withCover), { headers: { "content-type": "text/html" } }),
+      [POSTER]: cover,
+    });
+    const jpeg = () => new Response(COVER, { headers: { "content-type": "image/jpeg" } });
+
+    test("the cover is stored as the Reel's cover, the video is recorded as unavailable, and nothing is extracted", async () => {
+      const extractor = new FakeExtractor([0]);
+      const fetch = stubFetch(routes(jpeg));
+      const result = await strategy(SIZE, fetch, extractor).run(ITEM_ID);
+
+      assert.deepEqual([result.representation, result.request.status, result.alreadyComplete], ["cover", "stored", false]);
+      assert.equal(extractor.calls, 0);
+      assert.deepEqual(fetch.calls, [EMBED, POSTER]);
+      const assets = [...(await media())].sort((a, b) => a.id.localeCompare(b.id));
+      assert.deepEqual(assets.map((a) => [a.role, a.mediaType, a.retrieval.status]), [["cover", "image", "stored"], ["content", "video", "unavailable"]]);
+      assert.deepEqual(assets[1]?.retrieval, { status: "unavailable", checkedAt: "2026-10-02T12:00:00.000Z", reason: "restricted", detail: "Embed page has no video URL" });
+      assert.deepEqual(storedFiles().length, 1); // only the cover
+
+      // Complete: a second run fetches nothing.
+      const again = await strategy(SIZE, fetch, extractor).run(ITEM_ID);
+      assert.deepEqual([again.alreadyComplete, again.representation], [true, "cover"]);
+      assert.equal(fetch.calls.length, 2);
+    });
+
+    test("a failed cover download is retried; a stored cover is never downloaded again", async () => {
+      const failing = await strategy(SIZE, stubFetch(routes(() => new Response("", { status: 500 }))), new FakeExtractor([0])).run(ITEM_ID);
+      assert.equal(failing.request.status, "failed");
+      assert.ok(failing.request.nextAttemptAt);
+      assert.deepEqual((await media()).map((a) => [a.role, a.retrieval.status]), [["content", "unavailable"]]);
+
+      const retried = await strategy(SIZE, stubFetch(routes(jpeg)), new FakeExtractor([0])).run(ITEM_ID);
+      assert.deepEqual([retried.request.status, retried.representation], ["stored", "cover"]);
+
+      // A manual retry re-runs the item (e.g. to check for the video again): the stored cover is kept, not re-fetched.
+      await repo.saveMediaRetrievalRequest({ ...(await repo.getMediaRetrievalRequest(ITEM_ID))!, status: "pending" });
+      const rerun = stubFetch(routes(() => { throw new Error("the cover must not be downloaded again"); }));
+      const third = await strategy(SIZE, rerun, new FakeExtractor([0])).run(ITEM_ID);
+      assert.deepEqual([third.request.status, third.representation], ["stored", "cover"]);
+      assert.deepEqual(rerun.calls, [EMBED]);
+      assert.equal((await media()).filter((a) => a.role === "cover" && a.retrieval.status === "stored").length, 1);
+    });
+
+    test("without a published cover, the Reel is unavailable as before and nothing is stored", async () => {
+      const result = await strategy(SIZE, stubFetch(routes(jpeg, false)), new FakeExtractor([0])).run(ITEM_ID);
+      assert.deepEqual([result.request.status, result.request.lastFailure?.code, result.representation], ["unavailable", "restricted", undefined]);
+      assert.deepEqual(await media(), []);
+    });
+  });
+
   test("a video at or below the threshold is stored unchanged as the Reel's content video", async () => {
     const before = await repo.getArchiveItemAggregate(ITEM_ID);
     const extractor = new FakeExtractor([0]);

@@ -204,4 +204,50 @@ export const MIGRATIONS: readonly string[] = [
     ON media_assets (archive_item_id, position) WHERE role = 'content';
   CREATE INDEX media_assets_retrieval_status ON media_assets (retrieval_status);
   `,
+
+  /* 4: a post's cover image as its own role (Reels whose video is withheld) */ `
+  -- Rebuilt as in migration 3, adding role 'cover': an image with no
+  -- position, source asset or frame time, and at most one per item.
+  DROP INDEX media_assets_content_position;
+  DROP INDEX media_assets_retrieval_status;
+  ALTER TABLE media_assets RENAME TO media_assets_v3;
+
+  CREATE TABLE media_assets (
+    id                     TEXT PRIMARY KEY,
+    archive_item_id        TEXT NOT NULL REFERENCES archive_items (id),
+    role                   TEXT NOT NULL CHECK (role IN ('content', 'derived_frame', 'cover')),
+    media_type             TEXT NOT NULL CHECK (media_type IN ('image', 'video')),
+    position               INTEGER,
+    derived_from_asset_id  TEXT,
+    frame_time_ms          INTEGER,
+    retrieval_status       TEXT NOT NULL
+      CHECK (retrieval_status IN ('pending', 'stored', 'failed', 'unavailable')),
+    retrieval_json         TEXT NOT NULL CHECK (json_valid(retrieval_json)),
+    UNIQUE (id, archive_item_id),
+    FOREIGN KEY (derived_from_asset_id, archive_item_id)
+      REFERENCES media_assets (id, archive_item_id),
+    CHECK (
+      (role = 'content'
+        AND position IS NOT NULL AND position >= 0
+        AND derived_from_asset_id IS NULL AND frame_time_ms IS NULL)
+      OR (role = 'derived_frame'
+        AND position IS NULL
+        AND frame_time_ms IS NOT NULL AND frame_time_ms >= 0)
+      OR (role = 'cover'
+        AND media_type = 'image'
+        AND position IS NULL AND derived_from_asset_id IS NULL AND frame_time_ms IS NULL)
+    ),
+    CHECK (json_extract(retrieval_json, '$.status') = retrieval_status)
+  ) STRICT;
+
+  -- Content first, so every frame's source video already exists.
+  INSERT INTO media_assets
+    SELECT * FROM media_assets_v3 ORDER BY role = 'derived_frame', id;
+  DROP TABLE media_assets_v3;
+
+  CREATE UNIQUE INDEX media_assets_content_position
+    ON media_assets (archive_item_id, position) WHERE role = 'content';
+  CREATE UNIQUE INDEX media_assets_cover ON media_assets (archive_item_id) WHERE role = 'cover';
+  CREATE INDEX media_assets_retrieval_status ON media_assets (retrieval_status);
+  `,
 ];

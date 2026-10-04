@@ -10,6 +10,7 @@ import type {
 } from "../domain/archive-item.ts";
 import {
   contentAssetId,
+  coverAssetId,
   defaultRetryPolicy,
   derivedFrameAssetId,
   newRetrievalRequest,
@@ -149,11 +150,13 @@ export class MediaRetrievalService {
         storedPositions.add(position);
       }
     }
+    const existingCover = aggregate.media.find((m) => m.role === "cover");
+    const coverStored = existingCover?.retrieval.status === "stored" && (await this.storage.has(existingCover.retrieval.storageKey));
 
     const now = this.now();
     let outcome;
     try {
-      outcome = await adapter.retrieve(item, { storedPositions });
+      outcome = await adapter.retrieve(item, { storedPositions, coverStored });
     } catch (error) {
       outcome = { ok: false as const, failure: unexpected(error) };
     }
@@ -204,7 +207,33 @@ export class MediaRetrievalService {
       assets.push({ ...base, retrieval });
     }
 
-    const anyStored = storedPositions.size > 0 || storedAssets > 0;
+    // The post's cover image, if the adapter retrieved one (stored as a cover, never as content).
+    const cover = outcome.cover;
+    if (cover && cover.ok !== "already_stored") {
+      const id = coverAssetId(item.id);
+      let retrieval: MediaRetrieval;
+      if (cover.ok) {
+        try {
+          const stored = await this.storage.put(storageKeyFor(item.id, id, cover.mimeType), cover.bytes);
+          retrieval = {
+            status: "stored", storageKey: stored.storageKey, mimeType: cover.mimeType, retrievedAt: now, byteLength: cover.bytes.byteLength,
+            ...(cover.width !== undefined && { width: cover.width }),
+            ...(cover.height !== undefined && { height: cover.height }),
+          };
+          storedAssets++;
+        } catch (error) {
+          const failure: RetrievalFailure = { kind: "temporary", code: "storage_error", message: messageOf(error) };
+          failures.push(failure);
+          retrieval = assetFailure(failure, existingCover, now);
+        }
+      } else {
+        failures.push(cover.failure);
+        retrieval = assetFailure(cover.failure, existingCover, now);
+      }
+      assets.push({ id, archiveItemId: item.id, mediaType: "image", role: "cover", retrieval });
+    }
+
+    const anyStored = storedPositions.size > 0 || storedAssets > 0 || coverStored;
     const temporary = failures.find((f) => f.kind === "temporary");
     const next = temporary
       ? recordRetrievalFailure(request, temporary, now, this.retryPolicy)

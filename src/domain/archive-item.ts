@@ -178,6 +178,11 @@ export type MediaType = "image" | "video";
  *   slide, or a reel's video). Ordered by `position`.
  * - `derived_frame`: a frame extracted from the item's video. Frames are
  *   ordered chronologically by `frameTimeMs`.
+ * - `cover`: the post's published cover image (for a Reel, the still the
+ *   creator chose). At most one per item, always an image. It is neither the
+ *   video nor a frame of it, and may differ from the video entirely (e.g. a
+ *   designed title card). Stored when a Reel's video cannot be retrieved; the
+ *   video's own `content` asset then records why it is missing.
  */
 export type MediaAsset =
   | (MediaAssetBase & { role: "content"; position: number })
@@ -191,7 +196,8 @@ export type MediaAsset =
       derivedFromAssetId?: MediaAssetId;
       /** Offset into the source video. */
       frameTimeMs: number;
-    });
+    })
+  | (MediaAssetBase & { role: "cover"; mediaType: "image" });
 
 type MediaAssetBase = {
   id: MediaAssetId;

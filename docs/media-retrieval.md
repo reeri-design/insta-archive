@@ -48,7 +48,7 @@ Two more pieces connect them:
 - If nothing is stored at all, the request is `unavailable`.
 
 **Failures that retrying cannot fix** are recorded as `unavailable`, so they never take future retry slots (a manual retry still re-runs them):
-- **Reel with no `video_url`:** the embed describes the video but withholds its URL (seen with Reels using licensed music), and re-fetching returns the same page. Recorded as `unavailable / restricted`. The item and its metadata are left untouched.
+- **Reel with no `video_url`:** the embed describes the video but withholds its URL (seen with Reels using licensed music), and re-fetching returns the same page. The video is recorded as `unavailable / restricted`, and its published cover image is stored instead when the page offers one (see "Reels: when the video is withheld"). The item and its metadata are left untouched.
 - **Carousel video slide:** video slides are not downloaded yet. The slide is recorded as `unavailable / unknown` on its own asset, the image slides stay stored, and the request is `stored` (all obtainable media). Once video slides are supported, a manual retry fetches only the missing slides.
 
 ## Priority
@@ -88,8 +88,18 @@ Sampling keeps the first frame, then the first frame at or after each interval m
   - Frames have no `derivedFromAssetId`, carry their actual `frameTimeMs`, and record the discarded video in `retrieval.derivedFrom` (type, size, duration, dimensions).
   - Frames are extracted with the local `ffmpeg`/`ffprobe` and saved as lossless PNG.
   - A failed extraction leaves the request `failed`, never `stored`.
-- **Which path was used** can be read from the assets: a `content` video, or frames whose `retrieval.derivedFrom` shows the video's size.
+- **Which path was used** can be read from the assets: a `content` video, frames whose `retrieval.derivedFrom` shows the video's size, or a `cover` with the video recorded as unavailable.
 - **Frames may also be used later for AI and search.**
+
+### Reels: when the video is withheld
+
+Instagram's embed sometimes describes a Reel's video but gives no `video_url`. In the real archive this happened only for Reels using licensed music (not for all of them), and re-fetching returns the same page. The page still publishes the Reel's **cover image** (`display_resources` / `display_url`), so retrieval stores that instead:
+
+- The video's `content` asset (position 0) is recorded as `unavailable`, reason `restricted`.
+- The widest cover rendition is downloaded once and stored unchanged as the item's single `cover` asset (`<item>:cover`, an image with `width`/`height`). It is the still the creator chose, not a frame: it can differ from the video entirely, so it is never treated as the video or as a frame.
+- The request is then `stored` (all obtainable media). A failed cover download is a temporary failure and is retried; an already stored cover is never downloaded again (adapters receive `coverStored`).
+- Without a published cover, the request is `unavailable / restricted` as before, with nothing stored.
+- A manual retry checks for the video again. If it has become available it is stored as usual; the cover stays as a cover.
 - **The threshold is configurable and experimental.** Its default is 20 MB: the test Reel was 2.17 MB for 12.4 s, about 1.4 Mbit/s, so 20 MB is roughly 2 minutes.
 - **Rerunning a completed Reel fetches nothing,** whichever way it was stored. Changing the threshold later does not convert Reels that are already stored.
 

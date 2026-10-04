@@ -61,7 +61,7 @@ export default async function ItemPage({ params, searchParams }: PageProps<"/ite
 }
 
 function MediaSection({ detail }: { detail: ItemDetail }) {
-  const { media, frames, missingMedia } = detail;
+  const { media, frames, cover, missingMedia } = detail;
   return (
     <section className="media">
       {media.length > 0 && (
@@ -91,7 +91,15 @@ function MediaSection({ detail }: { detail: ItemDetail }) {
           </div>
         </>
       )}
-      {media.length === 0 && frames.length === 0 && <div className="no-media">No stored media</div>}
+      {cover && (
+        <figure className="slide">
+          <Image src={cover.url} alt="" width={720} height={1280} unoptimized />
+          <figcaption className="muted">
+            Cover image published with the post{media.length === 0 && " (the video itself could not be retrieved)"}
+          </figcaption>
+        </figure>
+      )}
+      {media.length === 0 && frames.length === 0 && !cover && <div className="no-media">No stored media</div>}
       {missingMedia.length > 0 && (
         <p className="muted">
           Not stored:{" "}

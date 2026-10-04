@@ -13,7 +13,7 @@ import { isDue } from "../../domain/media-retrieval.ts";
 import { LocalMediaStorage } from "../local-media-storage.ts";
 import { MediaRetrievalService } from "../media-retrieval-service.ts";
 import { embedUrlFor, type Fetch } from "./instagram-image-spike-adapter.ts";
-import { InstagramReelSpikeAdapter, parseReelVideo } from "./instagram-reel-spike-adapter.ts";
+import { InstagramReelSpikeAdapter, parseReelCover, parseReelVideo } from "./instagram-reel-spike-adapter.ts";
 
 const FIXTURES = join(import.meta.dirname, "../../importers/instagram/__fixtures__");
 const OWNER = "owner-1" as UserId;
@@ -145,13 +145,10 @@ describe("Reel spike through the retrieval service", () => {
     assert.deepEqual(await media(), []);
   });
 
-  test("2b. a Reel whose embed withholds the video URL is unavailable: kept intact, never retried automatically", async () => {
-    // As seen on real Reels: the embed describes the video (and a display image) but gives no video_url.
+  test("2b. a Reel whose embed withholds the video URL and shows no cover is unavailable: kept intact, never retried automatically", async () => {
+    // The embed describes the video but gives neither a video_url nor any display image.
     const withheld = reelHtml({
-      media: {
-        __typename: "GraphVideo", is_video: true, product_type: "clips", video_duration: 12.3,
-        dimensions: { width: 720, height: 1280 }, display_url: "https://cdn.example.test/poster.jpg",
-      },
+      media: { __typename: "GraphVideo", is_video: true, product_type: "clips", video_duration: 12.3, dimensions: { width: 720, height: 1280 } },
     });
     const before = await repo.getArchiveItemAggregate(ITEM_ID);
     const fetch = stubFetch({ [EMBED]: page(withheld) });
@@ -173,6 +170,79 @@ describe("Reel spike through the retrieval service", () => {
     // ...but a manual retry still re-runs it.
     const retried = await serviceWith(fetch).retryManually(ITEM_ID);
     assert.equal(isDue(retried, clock), true);
+  });
+
+  describe("cover image fallback (video withheld)", () => {
+    const POSTER = "https://cdn.example.test/poster.jpg";
+    const COVER_BYTES = new TextEncoder().encode("\xff\xd8 cover");
+    const jpeg = () => new Response(COVER_BYTES, { status: 200, headers: { "content-type": "image/jpeg" } });
+    // As seen on real Reels: video described, video_url absent, cover published.
+    const withheld = reelHtml({
+      media: {
+        __typename: "GraphVideo", is_video: true, product_type: "clips", video_duration: 12.3, dimensions: { width: 640, height: 1136 },
+        display_url: POSTER,
+        display_resources: [
+          { src: "https://cdn.example.test/poster-320.jpg", config_width: 320, config_height: 568 },
+          { src: POSTER, config_width: 640, config_height: 1136 },
+        ],
+      },
+    });
+
+    test("parseReelCover picks the widest rendition, else display_url", () => {
+      assert.deepEqual(parseReelCover(withheld), { url: POSTER, width: 640, height: 1136 });
+      assert.deepEqual(parseReelCover(reelHtml({ media: { is_video: true, display_url: "https://x.test/d.jpg" } })), { url: "https://x.test/d.jpg" });
+      assert.equal(parseReelCover(reelHtml({ media: { is_video: true } })), undefined);
+    });
+
+    test("the cover is stored as a cover; the video is recorded as unavailable; the item is done", async () => {
+      const before = await repo.getArchiveItemAggregate(ITEM_ID);
+      const fetch = stubFetch({ [EMBED]: page(withheld), [POSTER]: jpeg() });
+      const result = await run(fetch);
+
+      assert.deepEqual([result.request.status, result.request.nextAttemptAt], ["stored", undefined]);
+      assert.deepEqual(fetch.calls, [EMBED, POSTER]);
+      const assets = [...(await media())].sort((a, b) => a.id.localeCompare(b.id));
+      assert.deepEqual(assets.map((a) => [a.id, a.role, a.mediaType, a.retrieval.status]), [
+        [`${ITEM_ID}:cover`, "cover", "image", "stored"],
+        [`${ITEM_ID}:media:0`, "content", "video", "unavailable"],
+      ]);
+      const [cover, video] = assets;
+      assert.deepEqual(video?.retrieval, { status: "unavailable", checkedAt: clock, reason: "restricted", detail: "Embed page has no video URL" });
+      assert.ok(cover?.retrieval.status === "stored");
+      assert.deepEqual(
+        [cover.retrieval.mimeType, cover.retrieval.width, cover.retrieval.height, cover.retrieval.byteLength],
+        ["image/jpeg", 640, 1136, COVER_BYTES.byteLength],
+      );
+      assert.deepEqual(new Uint8Array(readFileSync(join(dir, "media", cover.retrieval.storageKey))), COVER_BYTES); // stored as retrieved
+      const after = await repo.getArchiveItemAggregate(ITEM_ID);
+      assert.deepEqual([after?.item, after?.sources], [before?.item, before?.sources]); // kind and metadata untouched
+
+      // Done: running it again fetches nothing.
+      const again = await serviceWith(fetch).process(ITEM_ID);
+      assert.equal(again.alreadyStored, true);
+      assert.equal(fetch.calls.length, 2);
+    });
+
+    test("a failed cover download is retryable, and the retry stores it", async () => {
+      const failing = stubFetch({ [EMBED]: page(withheld), [POSTER]: new Response("", { status: 500 }) });
+      const first = await run(failing);
+      assert.equal(first.request.status, "failed");
+      assert.ok(first.request.nextAttemptAt);
+      assert.match(first.request.lastFailure?.message ?? "", /Cover download failed/);
+      assert.deepEqual((await media()).map((a) => [a.role, a.retrieval.status]).sort(), [["content", "unavailable"], ["cover", "failed"]]);
+
+      clock = first.request.nextAttemptAt ?? clock;
+      const retried = await serviceWith(stubFetch({ [EMBED]: page(withheld), [POSTER]: jpeg() })).process(ITEM_ID);
+      assert.equal(retried.request.status, "stored");
+      assert.deepEqual((await media()).map((a) => [a.role, a.retrieval.status]).sort(), [["content", "unavailable"], ["cover", "stored"]]);
+    });
+
+    test("a Reel whose video is available stores the video and no cover", async () => {
+      const fetch = stubFetch({ [EMBED]: page(reelHtml()), [VIDEO_URL]: mp4() });
+      await run(fetch);
+      assert.deepEqual((await media()).map((a) => a.role), ["content"]);
+      assert.ok(!fetch.calls.includes(POSTER));
+    });
   });
 
   test("3. a failed video download keeps the item intact and is retryable", async () => {

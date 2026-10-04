@@ -757,6 +757,7 @@ function toMedia(row: MediaRow): MediaAsset {
     mediaType: row.media_type,
     retrieval: JSON.parse(row.retrieval_json) as MediaRetrieval,
   };
+  if (row.role === "cover") return { ...base, mediaType: "image", role: "cover" };
   return row.role === "content"
     ? { ...base, role: "content", position: row.position as number }
     : {

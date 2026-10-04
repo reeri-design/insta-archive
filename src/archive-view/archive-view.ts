@@ -150,10 +150,10 @@ function toCard(aggregate: ArchiveItemAggregate): ArchiveCard {
   };
 }
 
-/** The first stored image (slide or post), else the first stored frame, else a stored video. */
+/** The first stored image (slide or post), else the first stored frame, else the cover image, else a stored video. */
 function previewOf(aggregate: ArchiveItemAggregate): MediaPreview | undefined {
   const content = storedContent(aggregate);
-  const image = content.find((m) => m.mediaType === "image") ?? storedFrames(aggregate)[0];
+  const image = content.find((m) => m.mediaType === "image") ?? storedFrames(aggregate)[0] ?? storedCover(aggregate);
   if (image) return { mediaType: "image", url: mediaHref(aggregate.item, image) };
   const video = content.find((m) => m.mediaType === "video");
   return video && { mediaType: "video", url: mediaHref(aggregate.item, video) };
@@ -177,6 +177,8 @@ export type ItemDetail = {
   media: DisplayMedia[];
   /** Stored frames derived from a Reel's video, in time order. */
   frames: DisplayMedia[];
+  /** The post's published cover image, when stored (e.g. a Reel whose video was withheld). */
+  cover?: DisplayMedia;
   /** Assets that are not stored, with their status, e.g. "failed". */
   missingMedia: { position?: number; mediaType: "image" | "video"; status: string }[];
   /** The newest AI suggestion (suggestions are never edited). */
@@ -193,8 +195,10 @@ export async function getItemDetail(
   if (!aggregate) return undefined;
   const { item } = aggregate;
   const suggestion = latestSuggestion(aggregate);
+  const cover = storedCover(aggregate);
   return {
     aggregate,
+    ...(cover && { cover: { mediaType: "image" as const, url: mediaHref(item, cover) } }),
     media: storedContent(aggregate).map((m) => ({ mediaType: m.mediaType, url: mediaHref(item, m), position: m.position })),
     frames: storedFrames(aggregate).map((m) => ({ mediaType: m.mediaType, url: mediaHref(item, m), frameTimeMs: m.frameTimeMs })),
     missingMedia: aggregate.media
@@ -276,6 +280,10 @@ function storedContent(aggregate: ArchiveItemAggregate) {
   return aggregate.media
     .filter((m): m is Extract<MediaAsset, { role: "content" }> => m.role === "content" && m.retrieval.status === "stored")
     .sort((a, b) => a.position - b.position);
+}
+
+function storedCover(aggregate: ArchiveItemAggregate) {
+  return aggregate.media.find((m) => m.role === "cover" && m.retrieval.status === "stored");
 }
 
 function storedFrames(aggregate: ArchiveItemAggregate) {

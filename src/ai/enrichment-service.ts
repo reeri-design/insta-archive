@@ -145,7 +145,8 @@ export class AiEnrichmentService {
   /**
    * Stored media as images, in viewing order: content images (carousel slides
    * by position), else frames already stored for a frames-only Reel, else a
-   * few frames sampled from a stored Reel video into a temp dir (not kept).
+   * few frames sampled from a stored Reel video into a temp dir (not kept),
+   * else the post's cover image, described to the model as a cover.
    */
   private async collectImages(aggregate: ArchiveItemAggregate): Promise<{ images: AiImageInput[]; summary: MediaSummary }> {
     const stored = (m: MediaAsset) => m.retrieval.status === "stored";
@@ -179,6 +180,22 @@ export class AiEnrichmentService {
     const video = aggregate.media.find((m) => m.role === "content" && m.mediaType === "video" && stored(m));
     if (video && video.retrieval.status === "stored" && this.options.frameExtractor) {
       return this.sampleVideo(video.retrieval.storageKey);
+    }
+
+    // Last resort: the post's cover image (a Reel whose video was withheld).
+    const cover = aggregate.media.find((m) => m.role === "cover" && stored(m));
+    if (cover) {
+      const { images } = await this.loadImages([cover]);
+      return images.length
+        ? {
+            images,
+            summary: {
+              kind: "images",
+              count: 1,
+              description: "1 image attached: the post's published cover image (a single still chosen by the creator, not a frame of the video, which could not be retrieved).",
+            },
+          }
+        : none();
     }
     return none();
   }

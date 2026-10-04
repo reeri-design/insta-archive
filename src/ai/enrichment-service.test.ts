@@ -181,6 +181,31 @@ describe("AiEnrichmentService", () => {
     assert.equal((await repo.getArchiveItemAggregate(id("PostCCC333")))?.aiSuggestions[0]?.promptVersion, "organize-v1/media");
   });
 
+  test("media + metadata: a Reel whose video was withheld is organized from its cover image, described as a cover", async () => {
+    const reel = id("ReelAAA111");
+    // As retrieval leaves it: the video recorded as unavailable, the cover stored.
+    await repo.saveMediaAssets([{
+      id: `${reel}:media:0` as MediaAssetId, archiveItemId: reel, mediaType: "video", role: "content", position: 0,
+      retrieval: { status: "unavailable", checkedAt: T0, reason: "restricted", detail: "Embed page has no video URL" },
+    }]);
+    await storeAsset({ id: `${reel}:cover` as MediaAssetId, archiveItemId: reel, mediaType: "image", role: "cover" }, "image/jpeg", new TextEncoder().encode("cover"));
+
+    const result = await service().enrich(reel);
+    assert.ok(result.status === "enriched");
+    assert.deepEqual([result.mediaUsed, result.imageCount, result.organization.promptVersion], [true, 1, "organize-v1/media"]);
+    const [request] = provider.requests;
+    assert.deepEqual(request?.images.map((i) => new TextDecoder().decode(i.bytes)), ["cover"]);
+    assert.match(request?.content ?? "", /the post's published cover image \(a single still chosen by the creator, not a frame of the video, which could not be retrieved\)/);
+  });
+
+  test("the cover is only a last resort: stored content images are used instead", async () => {
+    const carousel = id("CarouBBB222");
+    await storeAsset({ id: `${carousel}:media:0` as MediaAssetId, archiveItemId: carousel, mediaType: "image", role: "content", position: 0 }, "image/jpeg", new TextEncoder().encode("slide"));
+    await storeAsset({ id: `${carousel}:cover` as MediaAssetId, archiveItemId: carousel, mediaType: "image", role: "cover" }, "image/jpeg", new TextEncoder().encode("cover"));
+    await service().enrich(carousel);
+    assert.deepEqual(provider.requests[0]?.images.map((i) => new TextDecoder().decode(i.bytes)), ["slide"]);
+  });
+
   test("missing media falls back to exactly the metadata-only request", async () => {
     const metadataOnly = async () => {
       const fresh = new FakeProvider();
@@ -436,6 +461,16 @@ describe("enrichment lifecycle: media-aware re-enrichment (the ceramic snake Ree
     const again = await serviceAt("2026-10-05T00:00:00.000Z").enrich(SNAKE);
     assert.deepEqual([again.status, again.status === "skipped" && again.reason], ["skipped", "already has a media-aware AI organization"]);
     assert.equal(provider.requests.length, 1);
+  });
+
+  test("a cover image stored later also makes a metadata-only organization eligible, and is what the AI sees", async () => {
+    await storeAsset({ id: `${SNAKE}:cover` as MediaAssetId, archiveItemId: SNAKE, mediaType: "image", role: "cover" }, "image/jpeg", new TextEncoder().encode("snake cover"), { retrievedAt: T_MEDIA });
+    assert.ok((await candidates()).includes(SNAKE));
+    const result = await serviceAt(T_REENRICHED).enrich(SNAKE);
+    assert.ok(result.status === "enriched");
+    assert.deepEqual([result.reenriched, result.organization.promptVersion], [true, "organize-v1/media"]);
+    assert.deepEqual(provider.requests[0]?.images.map((i) => new TextDecoder().decode(i.bytes)), ["snake cover"]);
+    assert.ok(!(await candidates()).includes(SNAKE)); // not redone
   });
 
   test("a batch picks it up, and new media the AI cannot use never causes a metadata-only repeat", async () => {

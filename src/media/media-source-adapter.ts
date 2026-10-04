@@ -22,6 +22,8 @@ export interface MediaSourceAdapter {
 export type RetrievalContext = {
   /** Content positions already stored; the adapter may skip downloading them. */
   storedPositions: ReadonlySet<number>;
+  /** The item's cover image is already stored; the adapter may skip it. */
+  coverStored?: boolean;
 };
 
 export type RetrievalOutcome =
@@ -32,6 +34,12 @@ export type RetrievalOutcome =
       /** Kind as observed at the source, if it can tell. */
       kind?: Exclude<ArchiveItemKind, "unknown">;
       metadata?: RetrievedMetadata;
+      /**
+       * The post's published cover image, when the adapter retrieved it (for a
+       * Reel: only when the video itself cannot be retrieved). Never a
+       * substitute content asset: it is stored with the `cover` role.
+       */
+      cover?: RetrievedAsset["result"];
     }
   | { ok: false; failure: RetrievalFailure };
 

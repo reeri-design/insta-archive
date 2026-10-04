@@ -33,6 +33,7 @@ ArchiveItem + already-stored media
   - carousel or post images, by position
   - a frames-only Reel's stored frames, in time order
   - for a stored Reel video, a few frames sampled into a temp folder (deleted afterwards, never stored); no video is ever sent
+  - last resort: the post's `cover` image (a Reel whose video was withheld). The media line tells the model it is the published cover image, a single still chosen by the creator and not a frame of the video. A cover stored after a metadata-only organization makes the item eligible for media-aware re-enrichment like any other newly stored media.
 - **Unusable images are left out:** a failed or unavailable asset, a missing file, a too-large image, or a type the provider can't accept (`supportedImageTypes`; Gemini takes JPEG, PNG and WEBP, not GIF). The prompt's media line names exactly which slides were sent. If nothing usable remains, the request is the unchanged metadata-only one.
 - **Provider-specific placement** happens in the adapter: Gemini gets the text first, then the images (Google's guidance).
 - **No stored media:** the item is enriched from metadata only. The prompt version records which variant ran (`organize-v1/media` or `organize-v1/metadata`), and metadata-only answers are asked to keep confidence ≤ 0.6.

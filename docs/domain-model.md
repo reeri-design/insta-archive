@@ -25,9 +25,10 @@ Message sources also carry `MessageContext`. It includes `userNote`, which holds
 
 **OriginalMetadata**: the best-known original facts about the post. Each field is `Attributed<T>`, which records whether the value came from the export or from retrieval. The export takes priority, and retrieval only fills in gaps. AI never writes here.
 
-**MediaAsset**: one of two roles:
+**MediaAsset**: one of three roles:
 - `content`: the single image, a carousel slide or a reel's video, ordered by `position`.
 - `derived_frame`: a frame extracted from the item's video, ordered by `frameTimeMs`. `derivedFromAssetId` names the stored `content` video; it is absent when the video was intentionally not retained because it exceeded the configured size threshold (see `docs/media-retrieval.md`).
+- `cover`: the post's published cover image (for a Reel, the still the creator chose). At most one per item, always an image, with no position or frame time. It is neither the video nor a frame of it and can differ from the video entirely (for example a designed title card). It is stored when a Reel's video cannot be retrieved; the video's `content` asset then records why (see `docs/media-retrieval.md`).
 
 **AiOrganization**: one AI suggestion, never edited after it is written. Re-running AI adds a new one. Each suggestion records provider, model, prompt version and taxonomy version.
 
@@ -41,7 +42,7 @@ Message sources also carry `MessageContext`. It includes `userNote`, which holds
   - Defined once in `src/domain/archive-scope.ts` (`MAIN_ARCHIVE_SOURCES`, `isInMainArchive`). Repository list queries take a `sources` option, so the filtering happens in SQL rather than in the UI.
 
 - **Deduplication:** items are keyed by `(ownerId, identity)`. `identity` is the Instagram shortcode, which is shared across `/p/`, `/reel/` and `/tv/` URLs. If no shortcode can be extracted, a normalized URL is used instead. A post that was saved, liked and sent in DMs becomes one item with three SourceRecords, and each record keeps its own URL and timestamp.
-- **Carousel and reel are one item each.** A carousel is one item with ordered `content` assets. A reel is one item with one `content` video plus any number of `derived_frame` assets.
+- **Carousel and reel are one item each.** A carousel is one item with ordered `content` assets. A reel is one item with one `content` video plus any number of `derived_frame` assets, and, when its video is withheld, a `cover` image.
 - **`kind: "unknown"` is valid.** The export often gives only a URL. The kind can be refined later, for example once retrieval shows a post is a carousel.
 - **Media failure never invalidates an item.** Retrieval is `pending | stored | failed | unavailable`, and `media` may be empty. `failed` means retryable; `unavailable` means the media is known to be gone (deleted, private and so on).
 - **Layers never mix.** Four layers stay separate:

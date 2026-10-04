@@ -182,6 +182,11 @@ export function contentAssetId(itemId: ArchiveItemId, position: number): MediaAs
   return `${itemId}:media:${position}` as MediaAssetId;
 }
 
+/** The item's single cover image asset. */
+export function coverAssetId(itemId: ArchiveItemId): MediaAssetId {
+  return `${itemId}:cover` as MediaAssetId;
+}
+
 export function derivedFrameAssetId(videoId: MediaAssetId, frameTimeMs: number): MediaAssetId {
   return `${videoId}:frame:${frameTimeMs}` as MediaAssetId;
 }

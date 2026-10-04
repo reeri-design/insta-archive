@@ -30,7 +30,7 @@ archive_items 1 ─┬─ n source_records
 | `archive_items` | `id` (importer id) | **`UNIQUE(owner_id, identity_kind, identity_value)`**: the dedup identity |
 | `source_records` | `id` (importer id, stored as-is) | `raw_json NOT NULL`; `message_json` only allowed when `source = 'messages'` |
 | `original_metadata` | `(archive_item_id, field)` | `field` ∈ creator, caption, postedAt; provenance must be *either* export + source record *or* retrieval + timestamp |
-| `media_assets` | `id` | content needs `position`; frames need `frame_time_ms` and no `position`, and `derived_from_asset_id` is optional (migration 3) but, when set, must be a video of the same item; unique `(item, position)` for content; `retrieval_status` must match `retrieval_json.status` |
+| `media_assets` | `id` | content needs `position`; frames need `frame_time_ms` and no `position`, and `derived_from_asset_id` is optional (migration 3) but, when set, must be a video of the same item; a `cover` (migration 4) is an image with no position, source or frame time, at most one per item; unique `(item, position)` for content; `retrieval_status` must match `retrieval_json.status` |
 | `ai_organizations` | `id` | `confidence` between 0 and 1; a trigger rejects every `UPDATE` (immutable) |
 | `curated_organizations` | `archive_item_id` | the primary key *is* the item, so there is at most one per item |
 | `media_retrieval_requests` | `archive_item_id` | one per item; `failed` requires a temporary failure and `unavailable` an unavailable one; only `pending` / `failed` may have a `next_attempt_at`; indexed for the queue (status, priority, next attempt) |

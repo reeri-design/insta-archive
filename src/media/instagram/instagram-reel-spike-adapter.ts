@@ -15,7 +15,7 @@
  */
 import type { ArchiveItem } from "../../domain/archive-item.ts";
 import type { RetrievalFailure } from "../../domain/media-retrieval.ts";
-import type { MediaSourceAdapter, RetrievalContext, RetrievalOutcome } from "../media-source-adapter.ts";
+import type { MediaSourceAdapter, RetrievalContext, RetrievalOutcome, RetrievedAsset } from "../media-source-adapter.ts";
 import {
   embedShortcodeMedia,
   embedUrlFor,
@@ -69,7 +69,16 @@ export class InstagramReelSpikeAdapter implements MediaSourceAdapter {
       // Instagram's embed states the post is a video but withholds its URL
       // (seen with Reels using licensed music). Re-fetching returns the same
       // page, so this is not retried; a manual retry can still re-run it.
-      return fail({ kind: "unavailable", code: "restricted", message: "Embed page has no video URL" });
+      const withheld: RetrievalFailure = { kind: "unavailable", code: "restricted", message: "Embed page has no video URL" };
+      const cover = parseReelCover(html);
+      if (!cover) return fail(withheld);
+      // The page still publishes the Reel's cover image: retrieve that instead,
+      // as a cover (never as the video), and record the video as unavailable.
+      return {
+        ok: true,
+        assets: [{ position: 0, mediaType: "video", result: { ok: false, failure: withheld } }],
+        cover: context.coverStored ? { ok: "already_stored" } : await this.downloadCover(cover),
+      };
     }
 
     const download = await fetchOrFailure(this.fetch, video.url);
@@ -98,6 +107,26 @@ export class InstagramReelSpikeAdapter implements MediaSourceAdapter {
       }],
     };
   }
+
+  /** Downloads the cover image; a failure is temporary (signed URLs expire, pages change). */
+  private async downloadCover(cover: { url: string; width?: number; height?: number }): Promise<RetrievedAsset["result"]> {
+    const download = await fetchOrFailure(this.fetch, cover.url);
+    if (!download.ok) {
+      if (download.failure.code === "rate_limited") return { ok: false, failure: download.failure };
+      return { ok: false, failure: { kind: "temporary", code: "unknown", message: `Cover download failed: ${download.failure.message}` } };
+    }
+    const mimeType = (download.response.headers.get("content-type") ?? "").split(";")[0]?.trim() ?? "";
+    if (!mimeType.startsWith("image/")) {
+      return { ok: false, failure: { kind: "temporary", code: "unknown", message: `Expected a cover image, got "${mimeType}"` } };
+    }
+    return {
+      ok: true,
+      bytes: new Uint8Array(await download.response.arrayBuffer()),
+      mimeType,
+      ...(cover.width !== undefined && { width: cover.width }),
+      ...(cover.height !== undefined && { height: cover.height }),
+    };
+  }
 }
 
 /** The video URL and the metadata the embed states about it. */
@@ -113,6 +142,20 @@ export function parseReelVideo(html: string): ReelVideo | undefined {
     ...(typeof dimensions?.width === "number" && { width: dimensions.width }),
     ...(typeof dimensions?.height === "number" && { height: dimensions.height }),
   };
+}
+
+/** The Reel's published cover image: its widest rendition, else display_url. */
+export function parseReelCover(html: string): { url: string; width?: number; height?: number } | undefined {
+  const media = embedShortcodeMedia(html);
+  if (!media) return undefined;
+  const resources = Array.isArray(media.display_resources)
+    ? (media.display_resources as { src?: unknown; config_width?: unknown; config_height?: unknown }[])
+        .filter((r): r is { src: string; config_width: number; config_height: number } =>
+          typeof r.src === "string" && typeof r.config_width === "number" && typeof r.config_height === "number")
+    : [];
+  const widest = [...resources].sort((a, b) => b.config_width - a.config_width)[0];
+  if (widest) return { url: widest.src, width: widest.config_width, height: widest.config_height };
+  return typeof media.display_url === "string" ? { url: media.display_url } : undefined;
 }
 
 function temporary(message: string): RetrievalOutcome {

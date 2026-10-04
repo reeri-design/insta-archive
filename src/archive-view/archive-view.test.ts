@@ -163,6 +163,26 @@ describe("detail", () => {
     assert.equal(await getItemDetail(repo, OWNER, "NoSuchItem1"), undefined);
   });
 
+  test("a Reel whose video was withheld shows its cover image as the preview and, separately, on the detail view", async () => {
+    const reel = id("ReelAAA111");
+    await repo.saveMediaAssets([{
+      id: `${reel}:media:0` as MediaAssetId, archiveItemId: reel, mediaType: "video", role: "content", position: 0,
+      retrieval: { status: "unavailable", checkedAt: T0, reason: "restricted", detail: "Embed page has no video URL" },
+    }]);
+    const coverId = `${reel}:cover` as MediaAssetId;
+    const key = storageKeyFor(reel, coverId, "image/jpeg");
+    await storage.put(key, new TextEncoder().encode("cover"));
+    await repo.saveMediaAssets([{ id: coverId, archiveItemId: reel, mediaType: "image", role: "cover", retrieval: { status: "stored", storageKey: key, mimeType: "image/jpeg", retrievedAt: T0 } }]);
+
+    const card = (await listArchiveCards(repo, OWNER, { pageSize: 50 })).cards.find((c) => c.href === "/items/ReelAAA111");
+    assert.deepEqual([card?.preview, card?.storedMediaCount], [{ mediaType: "image", url: "/items/ReelAAA111/media/cover" }, 0]);
+    const detail = await getItemDetail(repo, OWNER, "ReelAAA111");
+    assert.deepEqual([detail?.media, detail?.cover], [[], { mediaType: "image", url: "/items/ReelAAA111/media/cover" }]);
+    assert.deepEqual(detail?.missingMedia, [{ position: 0, mediaType: "video", status: "unavailable" }]);
+    const served = await readItemMedia(repo, storage, OWNER, "ReelAAA111", "cover");
+    assert.deepEqual([new TextDecoder().decode(served?.bytes), served?.mimeType], ["cover", "image/jpeg"]);
+  });
+
   test("media bytes are served only for the owner's stored assets", async () => {
     await storeSlide(0, "slide 0");
     await storeSlide(1, "slide 1", "failed");

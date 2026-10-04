@@ -10,6 +10,11 @@
  *    `derived_frame` assets without `derivedFromAssetId`, and delete the
  *    video. No video asset is kept.
  * The threshold is configurable and experimental (REEL_MAX_RETAINED_VIDEO_BYTES).
+ *
+ * When the source withholds the video (no video URL) but publishes the
+ * Reel's cover image, the cover is stored with the `cover` role and the
+ * video's `content` asset is recorded as unavailable. The cover is never
+ * treated as the video or as a frame of it.
  */
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,6 +28,7 @@ import type {
 } from "../../domain/archive-item.ts";
 import {
   contentAssetId,
+  coverAssetId,
   newRetrievalRequest,
   recordRetrievalFailure,
   recordRetrievalSuccess,
@@ -31,7 +37,7 @@ import {
   type RetrievalFailure,
 } from "../../domain/media-retrieval.ts";
 import type { ArchiveRepository } from "../../persistence/archive-repository.ts";
-import type { MediaSourceAdapter } from "../media-source-adapter.ts";
+import type { MediaSourceAdapter, RetrievedAsset } from "../media-source-adapter.ts";
 import { storageKeyFor, type MediaStorage } from "../media-storage.ts";
 
 // ---------------------------------------------------------------------------
@@ -123,7 +129,7 @@ export type ExtractedFrame = {
 // Strategy
 // ---------------------------------------------------------------------------
 
-export type ReelRepresentation = "video" | "frames";
+export type ReelRepresentation = "video" | "frames" | "cover";
 
 export type ReelMediaRun = {
   request: MediaRetrievalRequest;
@@ -182,14 +188,20 @@ export class ReelMediaRetrieval {
       return { request: failed, assets: [], alreadyComplete: false };
     };
 
-    const outcome = await adapter.retrieve(item, { storedPositions: new Set() });
+    const coverStored = await hasStoredCover(storage, aggregate);
+    const outcome = await adapter.retrieve(item, { storedPositions: new Set(), coverStored });
     if (!outcome.ok) return fail(outcome.failure);
     const download = outcome.assets[0];
     const video = download?.result;
     if (!download || download.mediaType !== "video" || !video || video.ok === "already_stored") {
       return fail(temporary("The adapter returned no video"));
     }
-    if (!video.ok) return fail(video.failure);
+    if (!video.ok) {
+      if (video.failure.kind === "unavailable" && outcome.cover) {
+        return this.storeCover(request, itemId, video.failure, outcome.cover, now);
+      }
+      return fail(video.failure);
+    }
     const byteLength = video.bytes.byteLength;
 
     let assets: MediaAsset[];
@@ -235,6 +247,65 @@ export class ReelMediaRetrieval {
       await repo.saveMediaRetrievalRequest(stored);
     });
     return { request: stored, representation, assets, videoByteLength: byteLength, alreadyComplete: false };
+  }
+
+  /**
+   * Cover path: the video is withheld, so its content asset records why, and
+   * the cover image is stored as the item's `cover` (once). The request is
+   * then done: all obtainable media is stored. A failed cover download leaves
+   * the request to be retried like any temporary failure.
+   */
+  private async storeCover(
+    request: MediaRetrievalRequest,
+    itemId: ArchiveItemId,
+    withheld: Extract<RetrievalFailure, { kind: "unavailable" }>,
+    cover: RetrievedAsset["result"],
+    now: IsoDateTime,
+  ): Promise<ReelMediaRun> {
+    const { repository, storage } = this.options;
+    const videoAsset: MediaAsset = {
+      id: contentAssetId(itemId, 0),
+      archiveItemId: itemId,
+      mediaType: "video",
+      role: "content",
+      position: 0,
+      retrieval: { status: "unavailable", checkedAt: now, reason: withheld.code, detail: withheld.message },
+    };
+    const assets: MediaAsset[] = [videoAsset];
+    let failure: RetrievalFailure | undefined;
+    if (cover.ok === true) {
+      const id = coverAssetId(itemId);
+      try {
+        const { storageKey } = await storage.put(storageKeyFor(itemId, id, cover.mimeType), cover.bytes);
+        assets.push({
+          id,
+          archiveItemId: itemId,
+          mediaType: "image",
+          role: "cover",
+          retrieval: {
+            status: "stored",
+            storageKey,
+            mimeType: cover.mimeType,
+            retrievedAt: now,
+            byteLength: cover.bytes.byteLength,
+            ...dimensions(cover),
+          },
+        });
+      } catch (error) {
+        failure = { kind: "temporary", code: "storage_error", message: messageOf(error) };
+      }
+    } else if (cover.ok === false) {
+      failure = cover.failure;
+    }
+
+    const next = failure ? recordRetrievalFailure(request, failure, now) : recordRetrievalSuccess(request, now);
+    await repository.withTransaction(async (repo) => {
+      await repo.saveMediaAssets(assets);
+      await repo.saveMediaRetrievalRequest(next);
+    });
+    return failure
+      ? { request: next, assets, alreadyComplete: false }
+      : { request: next, representation: "cover", assets, alreadyComplete: false };
   }
 
   /** Frames path: the video only ever exists in a temp directory. */
@@ -303,7 +374,14 @@ async function completedRepresentation(
   if (video.length > 0 && (await allStored(storage, video))) return { representation: "video", assets: video };
   const frames = aggregate.media.filter((m) => m.role === "derived_frame" && !m.derivedFromAssetId);
   if (frames.length > 0 && (await allStored(storage, frames))) return { representation: "frames", assets: frames };
+  const cover = aggregate.media.filter((m) => m.role === "cover");
+  if (cover.length > 0 && (await allStored(storage, cover))) return { representation: "cover", assets: cover };
   return undefined;
+}
+
+async function hasStoredCover(storage: MediaStorage, aggregate: ArchiveItemAggregate): Promise<boolean> {
+  const cover = aggregate.media.filter((m) => m.role === "cover");
+  return cover.length > 0 && (await allStored(storage, cover));
 }
 
 async function allStored(storage: MediaStorage, assets: MediaAsset[]): Promise<boolean> {
