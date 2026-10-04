@@ -27,6 +27,11 @@ export function promptVersionFor(media: MediaSummary): string {
   return `${PROMPT_VERSION}/${media.kind === "none" ? "metadata" : "media"}`;
 }
 
+/** Whether an organization's prompt version says the model saw the item's media. */
+export function promptVersionUsedMedia(promptVersion: string): boolean {
+  return !promptVersion.endsWith("/metadata");
+}
+
 export const ORGANIZATION_INSTRUCTIONS = `You organize items in a personal creative reference archive. Each item is a public Instagram post that the archive owner kept. You see the post's own information (its kind, creator, caption, posting date) and, when available, its images.
 
 Your job:

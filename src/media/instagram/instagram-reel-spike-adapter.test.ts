@@ -9,6 +9,7 @@ import { ingestInstagramExport } from "../../ingestion/instagram/ingest-export.t
 import { readExportDirectory } from "../../ingestion/instagram/read-export-directory.ts";
 import { openDatabase } from "../../persistence/sqlite/database.ts";
 import { SqliteArchiveRepository } from "../../persistence/sqlite/sqlite-archive-repository.ts";
+import { isDue } from "../../domain/media-retrieval.ts";
 import { LocalMediaStorage } from "../local-media-storage.ts";
 import { MediaRetrievalService } from "../media-retrieval-service.ts";
 import { embedUrlFor, type Fetch } from "./instagram-image-spike-adapter.ts";
@@ -127,7 +128,6 @@ describe("Reel spike through the retrieval service", () => {
     for (const [html, message] of [
       [reelHtml({ mediaType: "GraphImage" }), "Reel spike only supports videos; post is GraphImage"],
       [reelHtml({ mediaType: "GraphSidecar" }), "Reel spike only supports videos; post is GraphSidecar"],
-      [reelHtml({ media: { is_video: false } }), "Embed page has no video URL"],
     ] as const) {
       await repo.saveMediaRetrievalRequest({
         archiveItemId: ITEM_ID, priority: 0, status: "pending", attempts: 0, createdAt: clock, updatedAt: clock,
@@ -143,6 +143,36 @@ describe("Reel spike through the retrieval service", () => {
     await repo.saveMediaRetrievalRequest({ archiveItemId: ITEM_ID, priority: 0, status: "pending", attempts: 0, createdAt: clock, updatedAt: clock });
     assert.equal((await run(wrongType)).request.lastFailure?.message, 'Expected a video, got "text/html"');
     assert.deepEqual(await media(), []);
+  });
+
+  test("2b. a Reel whose embed withholds the video URL is unavailable: kept intact, never retried automatically", async () => {
+    // As seen on real Reels: the embed describes the video (and a display image) but gives no video_url.
+    const withheld = reelHtml({
+      media: {
+        __typename: "GraphVideo", is_video: true, product_type: "clips", video_duration: 12.3,
+        dimensions: { width: 720, height: 1280 }, display_url: "https://cdn.example.test/poster.jpg",
+      },
+    });
+    const before = await repo.getArchiveItemAggregate(ITEM_ID);
+    const fetch = stubFetch({ [EMBED]: page(withheld) });
+    const result = await run(fetch);
+
+    assert.deepEqual(
+      [result.request.status, result.request.attempts, result.request.nextAttemptAt, result.request.lastFailure],
+      ["unavailable", 1, undefined, { kind: "unavailable", code: "restricted", message: "Embed page has no video URL" }],
+    );
+    assert.deepEqual(fetch.calls, [EMBED]); // nothing else is fetched
+    assert.deepEqual(await media(), []);
+    // The item, its metadata and its sources are exactly as they were.
+    const after = await repo.getArchiveItemAggregate(ITEM_ID);
+    assert.deepEqual([after?.item, after?.sources], [before?.item, before?.sources]);
+    // Never due again on its own, however much later...
+    const muchLater = "2027-01-01T00:00:00.000Z";
+    assert.equal(isDue(result.request, muchLater), false);
+    assert.ok(!(await repo.listDueMediaRetrievals(muchLater)).some((r) => r.archiveItemId === ITEM_ID));
+    // ...but a manual retry still re-runs it.
+    const retried = await serviceWith(fetch).retryManually(ITEM_ID);
+    assert.equal(isDue(retried, clock), true);
   });
 
   test("3. a failed video download keeps the item intact and is retryable", async () => {

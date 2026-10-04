@@ -168,32 +168,60 @@ describe("scope", () => {
 });
 
 describe("ranking", () => {
-  test("items whose organization matches come first, ahead of caption or creator matches of more terms", async () => {
-    // "embroidery": LikedSaved4's organization matches (tags + summary); Embroid1 only has it in its caption.
-    const one = await search("embroidery");
-    assert.deepEqual(one.hits.map((h) => [h.item.id, h.organizationTerms, h.matchedTerms, h.score]), [
-      [id("LikedSaved4"), 1, 1, 5],
-      [id("Embroid1"), 0, 1, 1],
-    ]);
-    // "embroidery sketchbook café": Embroid1's caption matches two terms and Paris7's one, but
-    // LikedSaved4's organization says it is about embroidery, so it ranks first.
+  test("items matching more of the query come first, whatever the field", async () => {
+    // "embroidery sketchbook café": Embroid1's caption matches two terms; LikedSaved4 (AI tag) and Paris7 (caption) one each.
     const mixed = await search("embroidery sketchbook café");
-    assert.deepEqual(mixed.hits.map((h) => [h.item.id, h.organizationTerms, h.matchedTerms]), [
-      [id("LikedSaved4"), 1, 1],
-      [id("Embroid1"), 0, 2], // caption-only matches are still found, more terms first
-      [id("Paris7"), 0, 1],
+    assert.deepEqual(mixed.hits.map((h) => [h.item.id, h.matchedTerms, h.score]), [
+      [id("Embroid1"), 2, 4], // caption 2 + caption 2
+      [id("LikedSaved4"), 1, 3], // a specific AI tag (3) beats...
+      [id("Paris7"), 1, 2], // ...a caption mention (2) at equal coverage
     ]);
   });
 
-  test("among organized items, matching more terms in the organization ranks higher", async () => {
-    // "glaze reference": Ceramic5 matches both in its organization; Crayon2 and LikedSaved4 only "reference".
-    const result = await search("glaze reference");
-    assert.deepEqual(result.hits.map((h) => [h.item.id, h.organizationTerms]), [
-      [id("Ceramic5"), 2],
-      [id("LikedSaved4"), 1], // type "reference" (2) + usefulFor "stitch reference" (2) = 4
-      [id("Crayon2"), 1], // usefulFor "color palette reference" = 2
+  test("a full literal caption match beats a single generic AI match", async () => {
+    await addItem("GenericAI8", {
+      sources: ["saved"], caption: "studio day",
+      ai: { type: "inspiration", category: "art", summary: "A painting inspiration post.", usefulFor: ["visual inspiration for painting"] },
+    });
+    await addItem("Watercolor9", { sources: ["messages"], caption: "my watercolor painting process" });
+    const result = await search("watercolor painting");
+    assert.deepEqual(result.hits.map((h) => [h.item.id, h.matchedTerms]), [[id("Watercolor9"), 2], [id("GenericAI8"), 1]]);
+  });
+
+  test("a generic word repeated across AI fields does not outrank a literal caption match", async () => {
+    // "inspiration" is GenericAI8's type, summary and usefulFor: still only its best weight (1) counts.
+    await addItem("GenericAI8", {
+      sources: ["saved"], caption: "studio day",
+      ai: { type: "inspiration", category: "design", summary: "A design inspiration post.", usefulFor: ["inspiration for layouts"] },
+    });
+    await addItem("Outfit10", { sources: ["messages"], caption: "outfit check for autumn" });
+    const result = await search("outfit inspiration");
+    assert.deepEqual(result.hits.map((h) => [h.item.id, h.score, h.matchedFields.length]), [
+      [id("Outfit10"), 2, 1],
+      [id("GenericAI8"), 1, 3], // more fields, but a weaker match
+      [id("Crayon2"), 1, 1], // its type is "inspiration" too
     ]);
-    assert.ok(result.hits[1]!.score > result.hits[2]!.score);
+  });
+
+  test("caption-less items stay discoverable through their AI tags and summary", async () => {
+    await addItem("NoCaption11", { sources: ["messages"], ai: { tags: ["packaging design", "gift boxes"], summary: "Festive gift box packaging." } });
+    await addItem("BoxCaption12", { sources: ["saved"], caption: "packing my boxes for the move" });
+    const one = await search("packaging");
+    assert.deepEqual(one.hits.map((h) => [h.item.id, h.matchedFields]), [[id("NoCaption11"), ["tags", "summary"]]]);
+    // A specific tag outranks a caption mention, so it leads even a broader query.
+    const two = await search("gift boxes");
+    assert.deepEqual(two.hits.map((h) => [h.item.id, h.matchedTerms, h.score]), [[id("NoCaption11"), 2, 6], [id("BoxCaption12"), 1, 2]]);
+  });
+
+  test("at equal coverage and score, matching in more fields ranks higher", async () => {
+    // "glaze reference": Ceramic5 matches both terms. For "reference" alone, LikedSaved4 matches in type and
+    // usefulFor, Crayon2 only in usefulFor: same best weight (1), so corroboration decides.
+    const result = await search("glaze reference");
+    assert.deepEqual(result.hits.map((h) => [h.item.id, h.matchedTerms, h.score, h.matchedFields.length]), [
+      [id("Ceramic5"), 2, 4, 4],
+      [id("LikedSaved4"), 1, 1, 2],
+      [id("Crayon2"), 1, 1, 1],
+    ]);
   });
 
   test("a creator match still ranks above caption-only matches when no organization matches", async () => {

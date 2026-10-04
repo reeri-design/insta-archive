@@ -5,6 +5,7 @@
 import type { ArchiveItemId, UserId } from "../domain/archive-item.ts";
 import { isInMainArchive, MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import type { AiEnrichmentCandidate, ArchiveRepository } from "../persistence/archive-repository.ts";
+import { isEnrichmentCandidate } from "./enrichment-eligibility.ts";
 import type { AiEnrichmentService, EnrichmentResult } from "./enrichment-service.ts";
 
 /** Hard ceiling per run, so a batch can never cover the whole archive by accident. */
@@ -80,8 +81,9 @@ export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promi
 }
 
 /**
- * The items a batch will process: the named ones (first `limit`), or a
- * representative sample of items without an AI organization. Both are
+ * The items a batch will process: the named ones (first `limit`), or
+ * prioritizedSample of the items needing enrichment: those without an AI
+ * organization, and those organized without media that have media now. Both are
  * limited to the main archive (Saved + Messages): liked-only items are
  * never enriched.
  */
@@ -102,7 +104,29 @@ export async function selectItemsForEnrichment(
     }
     return ids;
   }
-  return representativeSample(await repository.listAiEnrichmentCandidates(ownerId, { sources: MAIN_ARCHIVE_SOURCES }), limit);
+  const candidates = await repository.listAiEnrichmentCandidates(ownerId, { sources: MAIN_ARCHIVE_SOURCES });
+  return prioritizedSample(candidates.filter(isEnrichmentCandidate), limit);
+}
+
+/**
+ * New captures first, then backfill. New items (imported after the initial
+ * import) are all taken, up to the limit: those with stored media first, then
+ * the most recent. Backfill fills the rest with representativeSample (media
+ * first, varied by kind, source and creator), so the historical archive is
+ * enriched opportunistically by whatever capacity is left. Items with neither
+ * a caption nor stored media are never chosen. Candidates are expected newest
+ * first.
+ */
+export function prioritizedSample(candidates: AiEnrichmentCandidate[], limit: number): ArchiveItemId[] {
+  const usable = (c: AiEnrichmentCandidate) => c.hasCaption || c.hasStoredMedia;
+  const fresh = candidates
+    .filter((c) => c.priority === "new" && usable(c))
+    // Stable sort: media first, otherwise keeping the newest-first order.
+    .sort((a, b) => Number(b.hasStoredMedia) - Number(a.hasStoredMedia))
+    .slice(0, limit)
+    .map((c) => c.itemId);
+  const backfill = candidates.filter((c) => c.priority === "backfill");
+  return [...fresh, ...representativeSample(backfill, limit - fresh.length)];
 }
 
 /**

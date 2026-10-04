@@ -83,7 +83,14 @@ export class InstagramCarouselSpikeAdapter implements MediaSourceAdapter {
 
   private async downloadSlide(slide: CarouselSlide): Promise<Omit<RetrievedAsset, "position">> {
     if (slide.isVideo) {
-      return slideFailure("video", "Video slides are not supported by the spike");
+      // Not supported yet, so retrying cannot help: the slide is recorded as
+      // unavailable instead of failed. The item is then not retried, and image
+      // slides stored alongside it are kept (see MediaRetrievalService). A
+      // manual retry re-runs the item once video slides are supported.
+      return {
+        mediaType: "video",
+        result: { ok: false, failure: { kind: "unavailable", code: "unknown", message: "Video slides are not supported by the spike" } },
+      };
     }
     if (!slide.image) return slideFailure("image", `Slide ${slide.id} has no renditions`);
 

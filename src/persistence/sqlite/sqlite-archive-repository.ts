@@ -345,7 +345,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async listDueMediaRetrievals(
     now: string,
     limit = 100,
-    options: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest" } = {},
+    options: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest"; sources?: readonly SourceKind[] } = {},
   ): Promise<MediaRetrievalRequest[]> {
     const order =
       options.order === "newest"
@@ -359,6 +359,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              OR (r.status = 'failed' AND r.next_attempt_at IS NOT NULL AND r.next_attempt_at <= :now))
            AND (:owner_id IS NULL OR i.owner_id = :owner_id)
            AND (:max_priority IS NULL OR r.priority <= :max_priority)
+           ${sourceFilter("r.archive_item_id", options.sources)}
          ORDER BY r.priority DESC, ${order}, r.archive_item_id
          LIMIT :limit`,
       )
@@ -379,15 +380,27 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            (SELECT json_extract(value_json, '$.username') FROM original_metadata m
               WHERE m.archive_item_id = i.id AND m.field = 'creator') AS creator,
            EXISTS (SELECT 1 FROM original_metadata m WHERE m.archive_item_id = i.id AND m.field = 'caption') AS has_caption,
-           EXISTS (SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored') AS has_media
+           EXISTS (SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored') AS has_media,
+           -- New: a (requested-kind) source record imported after the owner's first import.
+           EXISTS (SELECT 1 FROM source_records s WHERE s.archive_item_id = i.id ${sourceKindCondition("s", options.sources)}
+                     AND s.imported_at > (SELECT MIN(r.imported_at) FROM source_records r
+                                          JOIN archive_items o ON o.id = r.archive_item_id WHERE o.owner_id = :owner_id)) AS is_new,
+           latest_org.prompt_version AS org_prompt_version, latest_org.created_at AS org_created_at
          FROM archive_items i
-         WHERE i.owner_id = ? AND NOT EXISTS (SELECT 1 FROM ai_organizations o WHERE o.archive_item_id = i.id)
+         LEFT JOIN ai_organizations latest_org ON latest_org.rowid = (
+           SELECT o.rowid FROM ai_organizations o WHERE o.archive_item_id = i.id ORDER BY o.created_at DESC, o.rowid DESC LIMIT 1)
+         WHERE i.owner_id = :owner_id
+           -- Not organized yet, or media stored since the newest organization was made.
+           AND (latest_org.rowid IS NULL OR EXISTS (
+             SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored'
+               AND json_extract(a.retrieval_json, '$.retrievedAt') > latest_org.created_at))
            ${sourceFilter("i.id", options.sources)}
          ORDER BY latest_at DESC NULLS LAST, i.id`,
       )
-      .all(ownerId) as {
+      .all({ owner_id: ownerId }) as {
         id: string; kind: ArchiveItemKind; sources: string | null; latest_at: string | null;
-        creator: string | null; has_caption: number; has_media: number;
+        creator: string | null; has_caption: number; has_media: number; is_new: number;
+        org_prompt_version: string | null; org_created_at: string | null;
       }[];
     return rows.map((r) => ({
       itemId: r.id as ArchiveItemId,
@@ -397,6 +410,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       ...(r.creator !== null && { creatorUsername: r.creator }),
       hasCaption: r.has_caption === 1,
       hasStoredMedia: r.has_media === 1,
+      priority: r.is_new === 1 ? "new" : "backfill",
+      ...(r.org_prompt_version !== null && r.org_created_at !== null && {
+        latestOrganization: { promptVersion: r.org_prompt_version, createdAt: r.org_created_at },
+      }),
     }));
   }
 
@@ -415,12 +432,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       terms[i]?.anywhere ? `(instr(d.${field}, :t${i}) > 0)` : `(instr(' ' || d.${field}, ' ' || :t${i}) > 0)`;
     terms.forEach((term, i) => (params[`t${i}`] = term.text));
     const anyOf = (searched: readonly SearchField[], i: number) => `(${searched.map((f) => matches(f, i)).join(" OR ")})`;
+    // Each term counts once, with the weight of the best field it matched.
     const score = terms
-      .flatMap((_, i) => fields.map((f) => `${SEARCH_FIELD_WEIGHTS[f]} * ${matches(f, i)}`))
+      .map((_, i) => `max(${fields.map((f) => `${SEARCH_FIELD_WEIGHTS[f]} * ${matches(f, i)}`).join(", ")})`)
       .join(" + ");
     const matchedTerms = terms.map((_, i) => anyOf(fields, i)).join(" + ");
     const organizationTerms = terms.map((_, i) => anyOf(ORGANIZATION_SEARCH_FIELDS, i)).join(" + ");
     const fieldHits = fields.map((f) => `(${terms.map((_, i) => matches(f, i)).join(" OR ")}) AS hit_${f}`).join(", ");
+    const fieldCount = fields.map((f) => `hit_${f}`).join(" + ");
 
     const rows = this.db
       .prepare(
@@ -454,8 +473,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              (SELECT MAX(occurred_at) FROM source_records r WHERE r.archive_item_id = d.id) AS latest_at
            FROM docs d
          )
-         SELECT * FROM scored WHERE matched_terms > 0
-         ORDER BY organization_terms DESC, matched_terms DESC, score DESC, latest_at DESC NULLS LAST, id`,
+         SELECT *, ${fieldCount} AS field_count FROM scored WHERE matched_terms > 0
+         ORDER BY matched_terms DESC, score DESC, field_count DESC, latest_at DESC NULLS LAST, id`,
       )
       .all(params) as ({ id: string; organization_terms: number; matched_terms: number; score: number } & Record<string, unknown>)[];
 
@@ -476,11 +495,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return { total: rows.length, hits };
   }
 
-  async countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>> {
+  async countMediaRetrievalsByStatus(
+    options: { ownerId?: UserId; sources?: readonly SourceKind[] } = {},
+  ): Promise<Record<MediaRetrievalRequest["status"], number>> {
     const counts = { pending: 0, stored: 0, failed: 0, unavailable: 0 };
     const rows = this.db
-      .prepare("SELECT status, COUNT(*) AS n FROM media_retrieval_requests GROUP BY status")
-      .all() as { status: keyof typeof counts; n: number }[];
+      .prepare(
+        `SELECT r.status, COUNT(*) AS n FROM media_retrieval_requests r
+         JOIN archive_items i ON i.id = r.archive_item_id
+         WHERE (:owner_id IS NULL OR i.owner_id = :owner_id) ${sourceFilter("r.archive_item_id", options.sources)}
+         GROUP BY r.status`,
+      )
+      .all({ owner_id: options.ownerId ?? null }) as { status: keyof typeof counts; n: number }[];
     for (const row of rows) counts[row.status] = row.n;
     return counts;
   }
@@ -848,10 +874,15 @@ const SOURCE_KINDS: readonly SourceKind[] = ["messages", "saved", "liked"];
  */
 function sourceFilter(itemIdColumn: string, sources: readonly SourceKind[] | undefined): string {
   if (!sources) return "";
+  return `AND EXISTS (SELECT 1 FROM source_records sf WHERE sf.archive_item_id = ${itemIdColumn} ${sourceKindCondition("sf", sources)})`;
+}
+
+/** "AND <alias>.source IN (...)" for the given kinds, or nothing when none are given. */
+function sourceKindCondition(alias: string, sources: readonly SourceKind[] | undefined): string {
+  if (!sources) return "";
   for (const kind of sources) {
     if (!SOURCE_KINDS.includes(kind)) throw new Error(`Unknown source kind: ${String(kind)}`);
   }
   if (sources.length === 0) return "AND 0";
-  const list = sources.map((kind) => `'${kind}'`).join(", ");
-  return `AND EXISTS (SELECT 1 FROM source_records sf WHERE sf.archive_item_id = ${itemIdColumn} AND sf.source IN (${list}))`;
+  return `AND ${alias}.source IN (${sources.map((kind) => `'${kind}'`).join(", ")})`;
 }

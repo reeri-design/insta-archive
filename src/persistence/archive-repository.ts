@@ -88,19 +88,23 @@ export interface ArchiveRepository {
   /**
    * Requests due at `now` (see isDue): highest priority first, then by
    * `order`: the longest-waiting (default), or the newest item (latest
-   * save/like/DM date). Optionally only one owner's items and only
-   * priorities up to `maxPriority`.
+   * save/like/DM date). Optionally only one owner's items, only priorities
+   * up to `maxPriority`, and only items with a source record of one of
+   * `sources` (e.g. MAIN_ARCHIVE_SOURCES).
    */
   listDueMediaRetrievals(
     now: string,
     limit?: number,
-    options?: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest" },
+    options?: { ownerId?: UserId; maxPriority?: number; order?: "waiting" | "newest"; sources?: readonly SourceKind[] },
   ): Promise<MediaRetrievalRequest[]>;
 
   /**
-   * Items of an owner with no AI organization yet, newest first (latest
-   * save/like/DM date), with what enrichment needs to choose among them.
+   * Items of an owner that may need AI enrichment, newest first (latest
+   * save/like/DM date), with what enrichment needs to choose among them:
+   * items with no AI organization yet, and items with media stored after
+   * their newest AI organization was created (see latestOrganization).
    * With `sources`, only items with at least one source record of those kinds.
+   * Each carries its enrichment priority (see AiEnrichmentCandidate.priority).
    */
   listAiEnrichmentCandidates(
     ownerId: UserId,
@@ -112,9 +116,10 @@ export interface ArchiveRepository {
    * (the curated one if reviewed, else the latest AI suggestion): type,
    * category, tags, summary and usefulFor. Case-insensitive; terms match the
    * start of words (see parseSearchQuery). Ranking, in order: how many
-   * distinct terms the organization matches (what the item is about), how
-   * many match anywhere (caption and creator included), the weighted field
-   * score, then most recent.
+   * distinct query terms match anywhere, the score (each term's best field
+   * weight, summed), how many fields matched (corroboration), then most
+   * recent. AI fields assist but cannot, through generic words, outrank a
+   * more complete or stronger literal match.
    * Only items with a source record of one of `sources` are searched.
    * An empty query matches nothing.
    */
@@ -124,8 +129,13 @@ export interface ArchiveRepository {
     options: { sources: readonly SourceKind[]; limit?: number; offset?: number },
   ): Promise<{ total: number; hits: ArchiveSearchHit[] }>;
 
-  /** Number of retrieval requests per status. */
-  countMediaRetrievalsByStatus(): Promise<Record<MediaRetrievalRequest["status"], number>>;
+  /**
+   * Number of retrieval requests per status; optionally only one owner's
+   * items and only items with a source record of one of `sources`.
+   */
+  countMediaRetrievalsByStatus(
+    options?: { ownerId?: UserId; sources?: readonly SourceKind[] },
+  ): Promise<Record<MediaRetrievalRequest["status"], number>>;
 
   /**
    * Newest first: by `createdAt` (default), or with `order: "recent"` by the
@@ -141,7 +151,7 @@ export interface ArchiveRepository {
 
 export type ArchiveSearchHit = {
   item: ArchiveItem;
-  /** Weighted sum of term matches per field (see SEARCH_FIELD_WEIGHTS). */
+  /** Sum over matched terms of the weight of each term's best field (see SEARCH_FIELD_WEIGHTS). */
   score: number;
   /** How many distinct query terms matched somewhere. */
   matchedTerms: number;
@@ -159,6 +169,19 @@ export type AiEnrichmentCandidate = {
   creatorUsername?: string;
   hasCaption: boolean;
   hasStoredMedia: boolean;
+  /**
+   * The item's newest AI organization, when it has one (then media has been
+   * stored since it was created). Callers decide whether that warrants
+   * re-enrichment, e.g. only when it was made without media.
+   */
+  latestOrganization?: { promptVersion: string; createdAt: string };
+  /**
+   * "new": the item has a source record (of the requested kinds) imported
+   * after the owner's first import, i.e. a capture that arrived after the
+   * initial historical import. "backfill": everything from that first import.
+   * Derived from source records' importedAt; nothing is stored.
+   */
+  priority: "new" | "backfill";
 };
 
 /** Another item already holds this (ownerId, identity). */

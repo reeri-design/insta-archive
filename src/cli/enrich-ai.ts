@@ -7,6 +7,7 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { UserId } from "../domain/archive-item.ts";
+import { MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import { runEnrichmentBatch, selectItemsForEnrichment, MAX_ENRICHMENT_LIMIT } from "../ai/enrichment-batch.ts";
 import { AiEnrichmentService, type EnrichmentResult } from "../ai/enrichment-service.ts";
 import { createOrganizationProvider } from "../ai/providers/index.ts";
@@ -18,8 +19,9 @@ import { SqliteArchiveRepository } from "../persistence/sqlite/sqlite-archive-re
 const USAGE = `Usage: npm run enrich:ai -- --limit <n> [options]
 
   --limit <n>          Required, 1–${MAX_ENRICHMENT_LIMIT}. Items to enrich in this run.
-  --item <shortcode>   Enrich these items (repeatable); otherwise a deterministic,
-                       varied sample of items without an AI organization.
+  --item <shortcode>   Enrich these items (repeatable). Otherwise items without an
+                       AI organization: new captures first (imported after the
+                       initial import), then a varied sample of the backfill.
   --dry-run            Show which items would be enriched; no AI calls.
   --delay-ms <ms>      Pause between items (default 1000).
   --owner-id <id>      Archive owner (default "local").
@@ -55,7 +57,11 @@ async function main(): Promise<number> {
 
     if (values["dry-run"]) {
       const ids = await selectItemsForEnrichment({ repository, ownerId, limit, ...(values.item && { shortcodes: values.item }) });
-      console.log(`Would enrich ${ids.length} item(s) (no AI calls made):\n`);
+      const priority = new Map(
+        (await repository.listAiEnrichmentCandidates(ownerId, { sources: MAIN_ARCHIVE_SOURCES })).map((c) => [c.itemId, c.priority]),
+      );
+      const fresh = ids.filter((id) => priority.get(id) === "new").length;
+      console.log(`Would enrich ${ids.length} item(s): ${fresh} new, ${ids.length - fresh} backfill (no AI calls made):\n`);
       for (const [n, itemId] of ids.entries()) {
         const aggregate = await repository.getArchiveItemAggregate(itemId);
         if (!aggregate) continue;
@@ -63,7 +69,7 @@ async function main(): Promise<number> {
         const creator = aggregate.item.original.creator?.value.username;
         const caption = aggregate.item.original.caption?.value.replace(/\s+/g, " ").slice(0, 60);
         const media = aggregate.media.some((m) => m.retrieval.status === "stored") ? "media" : "metadata-only";
-        console.log(`${String(n + 1).padStart(2)}. ${itemId.split(":").pop()?.padEnd(12)} ${aggregate.item.kind.padEnd(8)} ${sources.padEnd(15)} ${media.padEnd(13)} ${creator ? `@${creator}` : "-"}  ${caption ? JSON.stringify(caption) : "(no caption)"}`);
+        console.log(`${String(n + 1).padStart(2)}. ${itemId.split(":").pop()?.padEnd(12)} ${(priority.get(itemId) ?? "-").padEnd(8)} ${aggregate.item.kind.padEnd(8)} ${sources.padEnd(15)} ${media.padEnd(13)} ${creator ? `@${creator}` : "-"}  ${caption ? JSON.stringify(caption) : "(no caption)"}`);
       }
       return 0;
     }
@@ -109,7 +115,7 @@ function formatResult(result: EnrichmentResult): string {
   const id = result.itemId.split(":").pop();
   if (result.status === "enriched") {
     const o = result.organization;
-    return `enriched  ${id}  [${result.mediaUsed ? `media ×${result.imageCount}` : "metadata-only"}]  ${o.fields.type}/${o.fields.category}  conf ${o.confidence}  (${o.model}, ${o.promptVersion})`;
+    return `${result.reenriched ? "re-enriched (media added)" : "enriched"}  ${id}  [${result.mediaUsed ? `media ×${result.imageCount}` : "metadata-only"}]  ${o.fields.type}/${o.fields.category}  conf ${o.confidence}  (${o.model}, ${o.promptVersion})`;
   }
   return `${result.status.padEnd(8)}  ${id}  ${result.status === "failed" ? `${result.kind}: ` : ""}${result.reason}`;
 }

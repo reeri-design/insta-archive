@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import type { ArchiveItemId, MediaAsset, MediaAssetId, UserId } from "../domain/archive-item.ts";
+import type { ArchiveItemId, MediaAsset, MediaAssetId, SourceKind, SourceRecordId, UserId } from "../domain/archive-item.ts";
+import { MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import { ingestInstagramExport } from "../ingestion/instagram/ingest-export.ts";
 import { readExportDirectory } from "../ingestion/instagram/read-export-directory.ts";
 import type { FrameExtractor } from "../media/instagram/reel-media.ts";
@@ -12,7 +13,8 @@ import { LocalMediaStorage } from "../media/local-media-storage.ts";
 import { storageKeyFor } from "../media/media-storage.ts";
 import { openDatabase } from "../persistence/sqlite/database.ts";
 import { SqliteArchiveRepository } from "../persistence/sqlite/sqlite-archive-repository.ts";
-import { representativeSample, runEnrichmentBatch } from "./enrichment-batch.ts";
+import { prioritizedSample, representativeSample, runEnrichmentBatch } from "./enrichment-batch.ts";
+import { isEnrichmentCandidate } from "./enrichment-eligibility.ts";
 import { AiEnrichmentService } from "./enrichment-service.ts";
 import { ORGANIZATION_INSTRUCTIONS } from "./organization-prompt.ts";
 import { GeminiOrganizationProvider, type GeminiModelsClient } from "./providers/gemini-organization-provider.ts";
@@ -238,7 +240,7 @@ describe("AiEnrichmentService", () => {
     const first = (await repo.getArchiveItemAggregate(id("PostCCC333")))?.aiSuggestions;
     provider.answer = async () => ({ output: { ...GOOD, category: "design" }, model: "fake-model-1" });
     const again = await service().enrich(id("PostCCC333"));
-    assert.deepEqual([again.status, again.status === "skipped" && again.reason], ["skipped", "already has an AI organization"]);
+    assert.deepEqual([again.status, again.status === "skipped" && again.reason], ["skipped", "already has an AI organization; no media stored since"]);
     assert.equal(provider.requests.length, 1);
     assert.deepEqual((await repo.getArchiveItemAggregate(id("PostCCC333")))?.aiSuggestions, first);
   });
@@ -292,7 +294,7 @@ describe("representative selection", () => {
     const byId = new Map(candidates.map((c) => [c.itemId, c]));
     assert.deepEqual(byId.get(id("ReelAAA111")), {
       itemId: id("ReelAAA111"), kind: "reel", sources: ["liked", "messages", "saved"],
-      latestAt: "2026-09-29T12:27:39.000Z", creatorUsername: "example_artist", hasCaption: true, hasStoredMedia: false,
+      latestAt: "2026-09-29T12:27:39.000Z", creatorUsername: "example_artist", hasCaption: true, hasStoredMedia: false, priority: "backfill",
     });
     assert.deepEqual([byId.get(id("BareDDD444"))?.hasCaption, byId.get(id("BareDDD444"))?.creatorUsername], [false, undefined]);
     await service().enrich(id("PostCCC333"));
@@ -301,7 +303,7 @@ describe("representative selection", () => {
 
   test("the sample spreads across kind/source groups and creators, deterministically", () => {
     const c = (n: number, kind: "reel" | "carousel" | "unknown", sources: ("liked" | "saved" | "messages")[], creator?: string, hasCaption = true) => ({
-      itemId: `i${n}` as ArchiveItemId, kind, sources, ...(creator && { creatorUsername: creator }), hasCaption, hasStoredMedia: false,
+      itemId: `i${n}` as ArchiveItemId, kind, sources, ...(creator && { creatorUsername: creator }), hasCaption, hasStoredMedia: false, priority: "backfill" as const,
     });
     const candidates = [ // newest first
       c(1, "reel", ["liked"], "ann"), c(2, "reel", ["liked"], "ann"), c(3, "reel", ["liked"], "bob"),
@@ -318,7 +320,7 @@ describe("representative selection", () => {
 
   test("items with stored media are selected before metadata-only items, still spread across groups and creators", () => {
     const c = (n: number, kind: "reel" | "carousel" | "post", sources: ("liked" | "saved" | "messages")[], creator: string, media: boolean, hasCaption = true) => ({
-      itemId: `i${n}` as ArchiveItemId, kind, sources, creatorUsername: creator, hasCaption, hasStoredMedia: media,
+      itemId: `i${n}` as ArchiveItemId, kind, sources, creatorUsername: creator, hasCaption, hasStoredMedia: media, priority: "backfill" as const,
     });
     const candidates = [ // newest first; the media items are deliberately the older ones
       c(1, "reel", ["liked"], "ann", false), c(2, "carousel", ["messages"], "bob", false), c(3, "post", ["saved"], "cat", false),
@@ -335,6 +337,196 @@ describe("representative selection", () => {
     // No metadata-only item comes before a media item.
     const withMedia = new Set(["i4", "i5", "i6", "i7"]);
     assert.ok(all.slice(0, 4).every((i) => withMedia.has(i)));
+  });
+});
+
+describe("enrichment lifecycle: media-aware re-enrichment (the ceramic snake Reel)", () => {
+  // Modelled on DdyyEHMx-nw: first organized from its caption alone, its video was stored later.
+  const SNAKE = id("DdyyEHMx-nw");
+  const T_ORGANIZED = "2026-10-03T08:44:00.000Z";
+  const T_MEDIA = "2026-10-03T09:55:00.000Z";
+  const T_REENRICHED = "2026-10-03T16:00:00.000Z";
+  const METADATA_ANSWER = { type: "inspiration", category: "craft", tags: ["snake", "cowboy hat", "figurine"], summary: "A cowboy snake figurine.", usefulFor: ["whimsical figurine ideas"], confidence: 0.5 };
+  const MEDIA_ANSWER = { type: "inspiration", category: "craft", tags: ["ceramic", "clay sculpture", "match holder", "cowboy snake"], summary: "A handmade yellow ceramic snake in a cowboy hat that holds matches.", usefulFor: ["clay figurine reference"], confidence: 0.9 };
+  const extractor: FrameExtractor = {
+    extract: async (_video, outDir) => {
+      mkdirSync(outDir, { recursive: true });
+      const path = join(outDir, "0.png");
+      writeFileSync(path, "snake frame");
+      return [{ frameTimeMs: 0, path, mimeType: "image/png" }];
+    },
+  };
+  const serviceAt = (now: string) =>
+    new AiEnrichmentService({ repository: repo, storage, provider, tempRoot, frameExtractor: extractor, now: () => now });
+  const candidates = async () =>
+    (await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES })).filter(isEnrichmentCandidate).map((c) => c.itemId);
+  const searchIds = async (q: string) =>
+    (await repo.searchArchiveItems(OWNER, q, { sources: MAIN_ARCHIVE_SOURCES })).hits.map((h) => h.item.id);
+  const storeVideo = (retrievedAt: string, mimeType = "video/mp4") =>
+    storeAsset({ id: `${SNAKE}:media:0` as MediaAssetId, archiveItemId: SNAKE, mediaType: "video", role: "content", position: 0 }, mimeType, new TextEncoder().encode("mp4"), { retrievedAt });
+
+  beforeEach(async () => {
+    await repo.saveArchiveItem({
+      id: SNAKE, ownerId: OWNER, identity: { kind: "shortcode", shortcode: "DdyyEHMx-nw" }, kind: "reel",
+      canonicalUrl: "https://www.instagram.com/reel/DdyyEHMx-nw/", createdAt: T0, updatedAt: T0,
+    });
+    await repo.addSourceRecords([{
+      id: "snake:messages" as SourceRecordId, archiveItemId: SNAKE, source: "messages", originalUrl: "https://www.instagram.com/reel/DdyyEHMx-nw/",
+      occurredAt: "2026-10-01T00:00:00.000Z", exportLocation: { file: "messages.json" }, raw: {}, importedAt: T0,
+    }]);
+    await repo.saveOriginalMetadata(SNAKE, {
+      caption: { value: "little cowboy snake 🤠 check out @aesthetic_arts_bygeorgia if you love snake friends!", provenance: { from: "export", sourceRecordId: "snake:messages" as SourceRecordId } },
+    });
+    // First enrichment: no media yet, so metadata-only.
+    provider.answer = async () => ({ output: METADATA_ANSWER, model: "fake-model-1" });
+    const first = await serviceAt(T_ORGANIZED).enrich(SNAKE);
+    assert.deepEqual([first.status, first.status === "enriched" && first.organization.promptVersion], ["enriched", "organize-v1/metadata"]);
+    provider.requests = [];
+    provider.answer = async () => ({ output: MEDIA_ANSWER, model: "fake-model-1" });
+  });
+
+  test("while nothing changes, a metadata-only organization is not redone", async () => {
+    const again = await serviceAt(T_REENRICHED).enrich(SNAKE);
+    assert.deepEqual([again.status, again.status === "skipped" && again.reason], ["skipped", "already has an AI organization; no media stored since"]);
+    assert.ok(!(await candidates()).includes(SNAKE));
+    assert.equal(provider.requests.length, 0);
+  });
+
+  test("failed or unavailable media does not make it eligible", async () => {
+    const base = { archiveItemId: SNAKE, mediaType: "video" as const, role: "content" as const };
+    await repo.saveMediaAssets([
+      { ...base, id: `${SNAKE}:media:0` as MediaAssetId, position: 0, retrieval: { status: "unavailable", checkedAt: T_MEDIA, reason: "restricted", detail: "Embed page has no video URL" } },
+      { ...base, id: `${SNAKE}:media:1` as MediaAssetId, position: 1, retrieval: { status: "failed", lastAttemptAt: T_MEDIA, attempts: 1, error: "unknown: boom" } },
+    ]);
+    assert.ok(!(await candidates()).includes(SNAKE));
+    assert.equal((await serviceAt(T_REENRICHED).enrich(SNAKE)).status, "skipped");
+    assert.equal(provider.requests.length, 0);
+  });
+
+  test("media stored after a metadata-only organization makes it eligible; re-enrichment appends a media-aware one", async () => {
+    assert.deepEqual(await searchIds("ceramic"), []); // the metadata-only organization knows nothing about clay
+    await storeVideo(T_MEDIA);
+    const candidate = (await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES })).find((c) => c.itemId === SNAKE);
+    assert.deepEqual([candidate?.hasStoredMedia, candidate?.latestOrganization], [true, { promptVersion: "organize-v1/metadata", createdAt: T_ORGANIZED }]);
+    assert.ok((await candidates()).includes(SNAKE));
+
+    const before = (await repo.getArchiveItemAggregate(SNAKE))?.aiSuggestions;
+    const result = await serviceAt(T_REENRICHED).enrich(SNAKE);
+    assert.ok(result.status === "enriched");
+    assert.deepEqual([result.reenriched, result.mediaUsed, result.organization.promptVersion], [true, true, "organize-v1/media"]);
+    assert.deepEqual(provider.requests[0]?.images.map((i) => new TextDecoder().decode(i.bytes)), ["snake frame"]);
+
+    // Immutable history: the first organization is untouched; the new one is appended after it.
+    const after = (await repo.getArchiveItemAggregate(SNAKE))?.aiSuggestions;
+    assert.equal(after?.length, 2);
+    assert.deepEqual(after?.[0], before?.[0]);
+    assert.deepEqual(after?.[1]?.fields.tags, MEDIA_ANSWER.tags);
+
+    // The newer, media-aware organization is the one search uses.
+    assert.deepEqual(await searchIds("ceramic"), [SNAKE]);
+    assert.deepEqual(await searchIds("clay sculpture"), [SNAKE]);
+    assert.deepEqual(await searchIds("whimsical"), []); // only the old organization said that
+  });
+
+  test("after media-aware re-enrichment it is never redone, even when more media arrives", async () => {
+    await storeVideo(T_MEDIA);
+    await serviceAt(T_REENRICHED).enrich(SNAKE);
+    await storeAsset({ id: `${SNAKE}:media:1` as MediaAssetId, archiveItemId: SNAKE, mediaType: "image", role: "content", position: 1 }, "image/jpeg", new Uint8Array([1]), { retrievedAt: "2026-10-04T00:00:00.000Z" });
+    assert.ok(!(await candidates()).includes(SNAKE));
+    const again = await serviceAt("2026-10-05T00:00:00.000Z").enrich(SNAKE);
+    assert.deepEqual([again.status, again.status === "skipped" && again.reason], ["skipped", "already has a media-aware AI organization"]);
+    assert.equal(provider.requests.length, 1);
+  });
+
+  test("a batch picks it up, and new media the AI cannot use never causes a metadata-only repeat", async () => {
+    await storeVideo(T_MEDIA);
+    const batch = await runEnrichmentBatch({ service: serviceAt(T_REENRICHED), repository: repo, ownerId: OWNER, limit: 1 });
+    assert.deepEqual(batch.results.map((r) => [r.itemId, r.status]), [[SNAKE, "enriched"]]); // stored media: first in the sample
+
+    // Separately: media the provider cannot take (here, an image type it does not accept).
+    const OTHER = id("ReelAAA111");
+    await serviceAt(T_ORGANIZED).enrich(OTHER); // metadata-only first
+    await storeAsset({ id: `${OTHER}:media:0` as MediaAssetId, archiveItemId: OTHER, mediaType: "image", role: "content", position: 0 }, "image/heic", new Uint8Array([1]), { retrievedAt: T_MEDIA });
+    const requests = provider.requests.length;
+    const skipped = await serviceAt(T_REENRICHED).enrich(OTHER);
+    assert.deepEqual([skipped.status, skipped.status === "skipped" && skipped.reason], ["skipped", "media stored since the last organization is not usable by the AI"]);
+    assert.equal(provider.requests.length, requests);
+    assert.equal((await repo.getArchiveItemAggregate(OTHER))?.aiSuggestions.length, 1);
+  });
+});
+
+describe("enrichment priority: new captures before backfill", () => {
+  const T1 = "2026-10-10T08:00:00.000Z"; // a later, incremental import
+  const LATER_SOURCE = { exportLocation: { file: "later.json" }, raw: {}, importedAt: T1 };
+
+  /** Simulates a later import: a new saved item, and new records on existing items. */
+  async function laterImport() {
+    await repo.saveArchiveItem({
+      id: id("NewSaved9"), ownerId: OWNER, identity: { kind: "shortcode", shortcode: "NewSaved9" }, kind: "post",
+      canonicalUrl: "https://www.instagram.com/p/NewSaved9/", createdAt: T1, updatedAt: T1,
+    });
+    await repo.saveArchiveItem({
+      id: id("NewLiked10"), ownerId: OWNER, identity: { kind: "shortcode", shortcode: "NewLiked10" }, kind: "post",
+      canonicalUrl: "https://www.instagram.com/p/NewLiked10/", createdAt: T1, updatedAt: T1,
+    });
+    await repo.addSourceRecords([
+      { ...LATER_SOURCE, id: "later:new-saved" as SourceRecordId, archiveItemId: id("NewSaved9"), source: "saved", originalUrl: "https://www.instagram.com/p/NewSaved9/", occurredAt: "2026-10-09T00:00:00.000Z" },
+      { ...LATER_SOURCE, id: "later:new-liked" as SourceRecordId, archiveItemId: id("NewLiked10"), source: "liked", originalUrl: "https://www.instagram.com/p/NewLiked10/", occurredAt: "2026-10-09T00:00:00.000Z" },
+      // The liked-only PostCCC333 is now saved too: it enters the main archive as a new capture.
+      { ...LATER_SOURCE, id: "later:post-saved" as SourceRecordId, archiveItemId: id("PostCCC333"), source: "saved", originalUrl: "https://www.instagram.com/p/PostCCC333/", occurredAt: "2026-10-08T00:00:00.000Z" },
+      // ReelAAA111 only gets a new like: it stays backfill.
+      { ...LATER_SOURCE, id: "later:reel-liked" as SourceRecordId, archiveItemId: id("ReelAAA111"), source: "liked", originalUrl: "https://www.instagram.com/reel/ReelAAA111/", occurredAt: "2026-10-09T00:00:00.000Z" },
+    ]);
+    await repo.saveOriginalMetadata(id("NewSaved9"), { caption: { value: "new embroidery find", provenance: { from: "export", sourceRecordId: "later:new-saved" as SourceRecordId } } });
+    await repo.saveOriginalMetadata(id("NewLiked10"), { caption: { value: "liked only", provenance: { from: "export", sourceRecordId: "later:new-liked" as SourceRecordId } } });
+  }
+  const priorities = async () =>
+    Object.fromEntries((await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES })).map((c) => [c.itemId.split(":").pop(), c.priority]));
+
+  test("the first import is backfill; main-archive records imported later make an item new", async () => {
+    assert.deepEqual(await priorities(), { ReelAAA111: "backfill", CarouBBB222: "backfill", BareDDD444: "backfill", ReplyEEE555: "backfill" });
+    await laterImport();
+    assert.deepEqual(await priorities(), {
+      NewSaved9: "new", PostCCC333: "new", // newly saved
+      ReelAAA111: "backfill", // only a new like: likes don't make an item a new capture
+      CarouBBB222: "backfill", BareDDD444: "backfill", ReplyEEE555: "backfill", // historical items stay eligible
+    }); // NewLiked10 is liked-only: not a candidate at all
+  });
+
+  test("a batch enriches new captures first (stored media first), then backfill; enriched items drop out", async () => {
+    await laterImport();
+    // PostCCC333 has stored media, so it comes before the newer, metadata-only NewSaved9.
+    await storeAsset({ id: `${id("PostCCC333")}:media:0` as MediaAssetId, archiveItemId: id("PostCCC333"), mediaType: "image", role: "content", position: 0 }, "image/jpeg", new Uint8Array([1]));
+    const first = await runEnrichmentBatch({ service: service(), repository: repo, ownerId: OWNER, limit: 2 });
+    assert.deepEqual(first.results.map((r) => [r.itemId, r.status]), [[id("PostCCC333"), "enriched"], [id("NewSaved9"), "enriched"]]);
+    assert.deepEqual(await priorities(), { ReelAAA111: "backfill", CarouBBB222: "backfill", BareDDD444: "backfill", ReplyEEE555: "backfill" });
+    // With the new captures done, the next batch continues the backfill.
+    const second = await runEnrichmentBatch({ service: service(), repository: repo, ownerId: OWNER, limit: 5 });
+    assert.deepEqual(second.results.map((r) => r.itemId).sort(), [id("CarouBBB222"), id("ReelAAA111")]);
+    const mainCandidates = await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES });
+    assert.ok(!mainCandidates.some((c) => c.itemId === id("NewLiked10"))); // liked-only stays out, even when newly imported
+    assert.equal(provider.requests.length, 4); // NewLiked10 (liked-only) was never sent
+  });
+
+  test("prioritizedSample: new items first (media, then newest), backfill fills the rest with the varied sample", () => {
+    const c = (n: number, priority: "new" | "backfill", kind: "reel" | "carousel", sources: SourceKind[], creator: string, media = false, hasCaption = true) => ({
+      itemId: `i${n}` as ArchiveItemId, kind, sources, creatorUsername: creator, hasCaption, hasStoredMedia: media, priority,
+    });
+    const candidates = [ // newest first
+      c(1, "backfill", "reel", ["saved"], "ann"), c(2, "new", "reel", ["saved"], "bob"), c(3, "backfill", "reel", ["saved"], "ann"),
+      c(4, "new", "carousel", ["messages"], "cat", true), c(5, "backfill", "carousel", ["messages"], "dan"),
+      c(6, "new", "reel", ["messages"], "eve", false, false), // new but nothing to classify: never chosen
+      c(7, "backfill", "reel", ["saved"], "fay", true), c(8, "backfill", "reel", ["saved"], "gus"),
+    ];
+    const backfill = candidates.filter((x) => x.priority === "backfill");
+    // New: i4 (media) then i2; then backfill as representativeSample picks it (media i7 first, then varied).
+    assert.deepEqual(prioritizedSample(candidates, 5), ["i4", "i2", ...representativeSample(backfill, 3)]);
+    assert.deepEqual(prioritizedSample(candidates, 5).slice(2), ["i7", "i1", "i5"]);
+    // A limit smaller than the new captures takes only new items.
+    assert.deepEqual(prioritizedSample(candidates, 1), ["i4"]);
+    // With no new captures, selection is exactly the existing varied backfill sample.
+    assert.deepEqual(prioritizedSample(backfill, 4), representativeSample(backfill, 4));
+    assert.ok(!prioritizedSample(candidates, 50).includes("i6" as ArchiveItemId));
   });
 });
 

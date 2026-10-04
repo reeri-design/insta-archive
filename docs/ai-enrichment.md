@@ -41,7 +41,8 @@ ArchiveItem + already-stored media
 ## Storage rules
 
 - **Append-only:** each result is a new `AiOrganization`, recording `provider`, `model` (the one that actually answered), `promptVersion`, `taxonomyVersion` and `confidence`.
-- **No re-enrichment:** an item that already has one is skipped.
+- **Re-enrichment only when media arrives:** an item is enriched when it has no AI organization yet. It is enriched *again* only when its newest organization was made without media (`organize-v1/metadata`) **and** media has been stored since that organization was created. The new, media-aware organization is appended; the old one is kept unchanged, and the newest is the effective AI organization (the one search uses unless a curated review exists).
+- **No repeats:** a media-aware organization is never redone. A metadata-only one is not redone while no new media has arrived. Failed or unavailable media never makes an item eligible. If the new media cannot be used by the AI (for example, an unsupported image type), the item is skipped without an AI call rather than organized from metadata again. The rule lives in `src/ai/enrichment-eligibility.ts`.
 - **Nothing else is written:** original metadata, sources, media and curated organization are never modified.
 
 ## Providers
@@ -69,7 +70,11 @@ npm run enrich:ai -- --limit 3 --item <shortcode> …  # specific items
 
 - **Limits:** `--limit` is required (1–100), so a run can never cover the whole archive.
 - **Scope:** only items in the main archive (Saved + Messages) are enriched. Liked-only items are never selected, and naming one with `--item` is refused.
-- **Selection:** without `--item`, items are chosen deterministically for variety. Items with stored media are chosen first, so the media-aware path gets exercised; metadata-only items fill the rest of the limit. Within each of these two tiers, groups are built from content kind × source context (e.g. "reel | liked") and visited in turn, newest item first, preferring creators not yet picked. Items with neither a caption nor stored media are never chosen.
+- **Priority:** two workloads share one queue, without any stored flag.
+  - **New captures:** items with a Saved or Messages source record imported *after the owner's first import*. Every import run stamps the records it adds with its own `importedAt`, and existing records are never rewritten, so only genuinely new saves and DMs carry a later time. They are taken first, all of them up to the limit: stored media first, then the most recent.
+  - **Backfill:** everything from the first (historical) import. It fills whatever room a batch has left, so it is enriched opportunistically. An old item that later gets only a new *like* stays backfill.
+  - Priority disappears on its own once an item is enriched. If the initial historical import was split over several runs, the later runs count as new captures.
+- **Selection:** without `--item`, backfill items are chosen deterministically for variety. Items with stored media are chosen first, so the media-aware path gets exercised; metadata-only items fill the rest of the limit. Within each of these two tiers, groups are built from content kind × source context (e.g. "reel | liked") and visited in turn, newest item first, preferring creators not yet picked. Items with neither a caption nor stored media are never chosen.
 - **Preview:** `--dry-run` lists the items a run would enrich, without any AI calls.
 - **Pacing:** items are processed one at a time with a pause between them (`--delay-ms`, default 1000).
 - **Stopping:** the batch stops early on a rate limit or on missing/invalid credentials. Other failures (refusals, invalid output, provider errors) are reported and save nothing.

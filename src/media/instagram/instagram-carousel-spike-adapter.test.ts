@@ -157,16 +157,64 @@ describe("carousel spike through the retrieval service", () => {
     assert.deepEqual(storedBytes(assets[1]!), slideBytes(1));
   });
 
-  test("4b. a video slide or missing slide data is not reported as a stored carousel", async () => {
-    const withVideo = serviceWith(stubFetch(carouselRoutes(3, carouselHtml(3, { videoAt: 1 }))));
-    await withVideo.enqueue(ITEM_ID);
-    assert.equal((await withVideo.process(ITEM_ID)).request.status, "failed");
-    assert.equal((await media())[1]?.retrieval.status, "failed");
+  test("4b. a video slide is recorded as unavailable; the image slides are stored and the item is not retried", async () => {
+    const fetch = stubFetch(carouselRoutes(3, carouselHtml(3, { videoAt: 1 })));
+    const service = serviceWith(fetch);
+    await service.enqueue(ITEM_ID);
+    const run = await service.process(ITEM_ID);
 
-    await repo.saveMediaRetrievalRequest({ ...(await repo.getMediaRetrievalRequest(ITEM_ID))!, status: "pending" });
+    // All obtainable media is stored, so the item is done; the video slide records why it is missing.
+    assert.equal(run.request.status, "stored");
+    assert.deepEqual(fetch.calls, [EMBED, slideUrl(0, 1080), slideUrl(2, 1080)]); // the video slide is never fetched
+    const assets = await media();
+    assert.deepEqual(assets.map((a) => [a.mediaType, a.retrieval.status]), [["image", "stored"], ["video", "unavailable"], ["image", "stored"]]);
+    assert.deepEqual(assets[1]?.retrieval, {
+      status: "unavailable", checkedAt: clock, reason: "unknown", detail: "Video slides are not supported by the spike",
+    });
+    assert.deepEqual([storedBytes(assets[0]!), storedBytes(assets[2]!)], [slideBytes(0), slideBytes(2)]);
+
+    // Not due again, and a later run neither fetches nor changes anything.
+    clock = "2027-01-01T00:00:00.000Z";
+    assert.ok(!(await repo.listDueMediaRetrievals(clock)).some((r) => r.archiveItemId === ITEM_ID));
+    const again = await service.process(ITEM_ID);
+    assert.equal(again.alreadyStored, true);
+    assert.equal(fetch.calls.length, 3);
+    assert.deepEqual(await media(), assets);
+  });
+
+  test("4c. image slides stored by an earlier, failed attempt stay stored when the item is re-run", async () => {
+    // The state real carousels were left in when a video slide counted as a temporary failure:
+    // image slides stored, the video slide failed, the request failed and due for a retry.
+    const first = stubFetch(carouselRoutes(3, carouselHtml(3, { videoAt: 1 })));
+    await serviceWith(first).enqueue(ITEM_ID);
+    await serviceWith(first).process(ITEM_ID);
+    const stored = (await media()).filter((a) => a.retrieval.status === "stored");
+    await repo.saveMediaAssets([{
+      id: `${ITEM_ID}:media:1` as MediaAsset["id"], archiveItemId: ITEM_ID, mediaType: "video", role: "content", position: 1,
+      retrieval: { status: "failed", lastAttemptAt: clock, attempts: 1, error: "unknown: Video slides are not supported by the spike" },
+    }]);
+    await repo.saveMediaRetrievalRequest({
+      ...(await repo.getMediaRetrievalRequest(ITEM_ID))!, status: "failed", nextAttemptAt: clock,
+      lastFailure: { kind: "temporary", code: "unknown", message: "Video slides are not supported by the spike" },
+    });
+
+    const retry = stubFetch(carouselRoutes(3, carouselHtml(3, { videoAt: 1 })));
+    const run = await serviceWith(retry).processNext();
+    assert.equal(run?.request.status, "stored");
+    assert.deepEqual(retry.calls, [EMBED]); // stored image slides are not downloaded again
+    const assets = await media();
+    assert.deepEqual([assets[0], assets[2]], stored); // unchanged, bytes included
+    assert.deepEqual([storedBytes(assets[0]!), storedBytes(assets[2]!)], [slideBytes(0), slideBytes(2)]);
+    assert.equal(assets[1]?.retrieval.status, "unavailable");
+    assert.equal(fileCount(), 2);
+  });
+
+  test("4d. missing slide data stays a retryable failure", async () => {
     const noData = serviceWith(stubFetch({ [EMBED]: page(carouselHtml(3, { contextJSON: "null" })) }));
+    await noData.enqueue(ITEM_ID);
     const run = await noData.process(ITEM_ID);
     assert.equal(run.request.status, "failed");
+    assert.ok(run.request.nextAttemptAt);
     assert.equal(run.request.lastFailure?.message, "Embed page has no carousel slide data");
   });
 

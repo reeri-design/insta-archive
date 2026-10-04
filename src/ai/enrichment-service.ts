@@ -2,6 +2,8 @@
  * AI enrichment: ArchiveItem + already-stored media → provider → validated
  * AiOrganization (appended, immutable). Never downloads media, and never
  * writes original metadata, curation or anything else about the item.
+ * Which items need it, including media-aware re-enrichment of items first
+ * organized without media, is decided by enrichmentNeed.
  */
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,6 +32,7 @@ import {
   type MediaSummary,
 } from "./organization-prompt.ts";
 import { ORGANIZATION_OUTPUT_SCHEMA, TAXONOMY_VERSION, validateOrganizationOutput } from "./organization-schema.ts";
+import { enrichmentNeed } from "./enrichment-eligibility.ts";
 
 /**
  * Images per request, and size limits that stay well inside provider limits.
@@ -47,6 +50,8 @@ export type EnrichmentResult =
   | {
       status: "enriched";
       itemId: ArchiveItemId;
+      /** A media-aware organization added because media arrived after a metadata-only one. */
+      reenriched: boolean;
       organization: AiOrganization;
       mediaUsed: boolean;
       imageCount: number;
@@ -82,11 +87,14 @@ export class AiEnrichmentService {
     const { repository, provider } = this.options;
     const aggregate = await repository.getArchiveItemAggregate(itemId);
     if (!aggregate) throw new Error(`Unknown archive item ${itemId}`);
-    if (aggregate.aiSuggestions.length > 0) {
-      return { status: "skipped", itemId, reason: "already has an AI organization" };
-    }
+    const need = enrichmentNeed(aggregate);
+    if (!need.eligible) return { status: "skipped", itemId, reason: need.reason };
 
     const { images, summary } = await this.collectImages(aggregate);
+    if (need.reason === "media_added" && images.length === 0) {
+      // Redoing it from metadata alone would only repeat the existing organization.
+      return { status: "skipped", itemId, reason: "media stored since the last organization is not usable by the AI" };
+    }
     if (images.length === 0 && !aggregate.item.original.caption?.value.trim()) {
       return { status: "skipped", itemId, reason: "no caption or stored media to classify" };
     }
@@ -121,10 +129,12 @@ export class AiEnrichmentService {
       promptVersion: promptVersionFor(summary),
       createdAt,
     };
+    // Appended, never replacing the earlier one; the newest is the effective AI organization.
     await repository.appendAiOrganization(organization);
     return {
       status: "enriched",
       itemId,
+      reenriched: need.reason === "media_added",
       organization,
       mediaUsed: images.length > 0,
       imageCount: images.length,

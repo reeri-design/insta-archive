@@ -2,13 +2,18 @@
  * A controlled, resumable media retrieval batch. Source-agnostic: the
  * per-item work is done by an injected retriever (Instagram today).
  *
- * Each run makes sure every item of the owner has a retrieval request, then
- * works through due requests one at a time: highest priority first, newest
- * item first within a priority. It stops early only on a rate limit; any
- * other failure is recorded on that item and the batch moves on. All state
- * lives in the requests, so running again simply continues.
+ * Each run makes sure every main-archive item of the owner has a retrieval
+ * request, then works through due requests one at a time: highest priority
+ * first, newest item first within a priority. It stops early only on a rate
+ * limit; any other failure is recorded on that item and the batch moves on.
+ * All state lives in the requests, so running again simply continues.
+ *
+ * Only the main archive (Saved + Messages) is retrieved. Liked-only items get
+ * no new requests, and requests they already have are left exactly as they
+ * are: never selected, never modified, and not counted in the summary.
  */
 import type { ArchiveItemId, IsoDateTime, UserId } from "../domain/archive-item.ts";
+import { MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import {
   newRetrievalRequest,
   RETRIEVAL_PRIORITY,
@@ -76,11 +81,12 @@ export class MediaRetrievalJob {
   async run(params: { ownerId: UserId; limit: number; maxPriority?: number }): Promise<MediaRetrievalJobSummary> {
     const { repository, delayMs, now, sleep } = this.options;
     const started = Date.now();
+    const scope = { ownerId: params.ownerId, sources: MAIN_ARCHIVE_SOURCES };
     const enqueued = await this.enqueueMissing(params.ownerId);
-    const statusBefore = await repository.countMediaRetrievalsByStatus();
+    const statusBefore = await repository.countMediaRetrievalsByStatus(scope);
 
     const due = await repository.listDueMediaRetrievals(now(), params.limit, {
-      ownerId: params.ownerId,
+      ...scope,
       order: "newest",
       ...(params.maxPriority !== undefined && { maxPriority: params.maxPriority }),
     });
@@ -98,9 +104,9 @@ export class MediaRetrievalJob {
     }
 
     const count = (outcome: JobItemOutcome) => items.filter((i) => i.outcome === outcome).length;
-    const statusAfter = await repository.countMediaRetrievalsByStatus();
+    const statusAfter = await repository.countMediaRetrievalsByStatus(scope);
     const remainingDue = (await repository.listDueMediaRetrievals(now(), Number.MAX_SAFE_INTEGER, {
-      ownerId: params.ownerId,
+      ...scope,
       ...(params.maxPriority !== undefined && { maxPriority: params.maxPriority }),
     })).length;
     return {
@@ -138,7 +144,7 @@ export class MediaRetrievalJob {
     return { ...base, outcome: "error", detail: `Request still ${request.status} after retrieval` };
   }
 
-  /** One request per item, created in a single transaction. */
+  /** One request per main-archive item, created in a single transaction. */
   private async enqueueMissing(ownerId: UserId): Promise<number> {
     const { repository, now } = this.options;
     const createdAt = now();
@@ -146,7 +152,7 @@ export class MediaRetrievalJob {
       let created = 0;
       const pageSize = 1000;
       for (let offset = 0; ; offset += pageSize) {
-        const page = await repo.listArchiveItems(ownerId, { limit: pageSize, offset });
+        const page = await repo.listArchiveItems(ownerId, { limit: pageSize, offset, sources: MAIN_ARCHIVE_SOURCES });
         for (const item of page) {
           // Every item is "normal" until owner-exchange detection exists.
           if (await repo.enqueueMediaRetrieval(newRetrievalRequest(item.id, RETRIEVAL_PRIORITY.normal, createdAt))) created++;

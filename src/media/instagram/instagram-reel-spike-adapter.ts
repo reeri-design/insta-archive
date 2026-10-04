@@ -65,7 +65,12 @@ export class InstagramReelSpikeAdapter implements MediaSourceAdapter {
       );
     }
     const video = parseReelVideo(html);
-    if (!video) return temporary("Embed page has no video URL");
+    if (!video) {
+      // Instagram's embed states the post is a video but withholds its URL
+      // (seen with Reels using licensed music). Re-fetching returns the same
+      // page, so this is not retried; a manual retry can still re-run it.
+      return fail({ kind: "unavailable", code: "restricted", message: "Embed page has no video URL" });
+    }
 
     const download = await fetchOrFailure(this.fetch, video.url);
     if (!download.ok) {

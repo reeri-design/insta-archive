@@ -47,6 +47,10 @@ Two more pieces connect them:
 - Otherwise, if at least one asset is stored, the request is `stored`. Slides that are permanently gone stay `unavailable` on their own asset.
 - If nothing is stored at all, the request is `unavailable`.
 
+**Failures that retrying cannot fix** are recorded as `unavailable`, so they never take future retry slots (a manual retry still re-runs them):
+- **Reel with no `video_url`:** the embed describes the video but withholds its URL (seen with Reels using licensed music), and re-fetching returns the same page. Recorded as `unavailable / restricted`. The item and its metadata are left untouched.
+- **Carousel video slide:** video slides are not downloaded yet. The slide is recorded as `unavailable / unknown` on its own asset, the image slides stay stored, and the request is `stored` (all obtainable media). Once video slides are supported, a manual retry fetches only the missing slides.
+
 ## Priority
 
 Priority is a number, and higher runs first. Requests with equal priority run longest-waiting first. Defaults:
@@ -93,8 +97,9 @@ Sampling keeps the first frame, then the first frame at or after each interval m
 
 `npm run retrieve:media -- --limit 20` retrieves media for a small, controlled batch (`src/cli/retrieve-media.ts`, `src/media/media-retrieval-job.ts`). **Start with a small batch** (about 20–50) and check the results before going bigger. Never run the whole archive in one go.
 
+- **Scope: main archive only (Saved + Messages).** Liked-only items get no new requests. Requests they already have stay exactly as they are: never picked, never changed, and not counted in the run summary.
 - **Each run:**
-  1. Creates a `pending` retrieval request for every item that has none. This makes no network requests.
+  1. Creates a `pending` retrieval request for every main-archive item that has none. This makes no network requests.
   2. Picks up to `--limit` *due* requests: highest priority first, then the newest item (its latest save, like or DM date).
   3. Retrieves them one at a time, pausing between items (`--delay-ms`, default 2000).
 - **Priorities:** only two tiers exist: owner exchange (100) and normal (0). Until owner-exchange detection is built, every item is normal. `--from-priority <n>` limits the run to requests with priority ≤ n.

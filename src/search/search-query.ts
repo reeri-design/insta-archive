@@ -7,23 +7,30 @@
 /** A query term. CJK terms match anywhere, since those scripts don't separate words with spaces. */
 export type SearchTerm = { text: string; anywhere: boolean };
 
-/** Fields a search looks in, with the weight a matching term adds to the score. */
+/**
+ * Fields a search looks in, with the weight of a term matching there. A term
+ * scores its single best field (repeating a word across fields earns
+ * nothing extra). Specific fields (tags, creator) weigh most and the literal
+ * caption next; descriptive or generic AI fields (summary, usefulFor, and the
+ * fixed type/category vocabulary) only assist, so a generic word matched
+ * there never outweighs a literal caption match.
+ */
 export const SEARCH_FIELD_WEIGHTS = {
   tags: 3,
   creator: 3,
-  type: 2,
-  category: 2,
-  summary: 2,
-  usefulFor: 2,
-  caption: 1,
+  caption: 2,
+  summary: 1,
+  usefulFor: 1,
+  type: 1,
+  category: 1,
 } as const;
 
 export type SearchField = keyof typeof SEARCH_FIELD_WEIGHTS;
 
 /**
- * The item's organization (curated, else AI): what the item is about, as
- * opposed to words that merely appear in its caption or creator name.
- * Matches here rank first.
+ * The item's organization (curated, else AI), as opposed to the original
+ * caption and creator. Reported per hit (organizationTerms) to explain where
+ * a match came from; ranking itself uses SEARCH_FIELD_WEIGHTS.
  */
 export const ORGANIZATION_SEARCH_FIELDS: readonly SearchField[] = ["tags", "type", "category", "summary", "usefulFor"];
 

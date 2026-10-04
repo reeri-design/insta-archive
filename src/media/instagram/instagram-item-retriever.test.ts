@@ -162,7 +162,7 @@ describe("removed posts", () => {
 });
 
 test("job + Instagram retriever: a rate limit mid-batch stops the run", async () => {
-  // Newest first: ReelAAA111, CarouBBB222, ReplyEEE555, PostCCC333, BareDDD444.
+  // Newest first: ReelAAA111, CarouBBB222, ReplyEEE555, BareDDD444 (PostCCC333 is liked-only: never retrieved).
   const fetch = stubFetch({
     [embedUrlFor("ReelAAA111")]: html(reelPage()),
     [cdn("reel.mp4")]: bytes("video/mp4", "mp4"),
@@ -172,6 +172,6 @@ test("job + Instagram retriever: a rate limit mid-batch stops the run", async ()
   const summary = await job.run({ ownerId: OWNER, limit: 10 });
   assert.deepEqual(summary.items.map((i) => [i.itemId, i.outcome]), [[id("ReelAAA111"), "stored"], [id("CarouBBB222"), "rate_limited"]]);
   assert.equal(summary.rateLimited, true);
-  assert.equal(summary.remainingDue, 3);
+  assert.equal(summary.remainingDue, 2); // ReplyEEE555 and BareDDD444
   assert.ok(!fetch.calls.some((u) => u.includes("ReplyEEE555") || u.includes("PostCCC333")));
 });
