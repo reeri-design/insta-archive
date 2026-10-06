@@ -10,7 +10,7 @@ import type {
   UserId,
 } from "../../domain/archive-item.ts";
 import { MAIN_ARCHIVE_SOURCES } from "../../domain/archive-scope.ts";
-import { normalizeSearchText, parseSearchQuery } from "../../search/search-query.ts";
+import { normalizeSearchText, planSearch, searchText, singularForms } from "../../search/search-query.ts";
 import { openDatabase } from "./database.ts";
 import { SqliteArchiveRepository } from "./sqlite-archive-repository.ts";
 
@@ -119,7 +119,7 @@ describe("search matches each field", () => {
   });
 
   test("AI summary", async () => {
-    const result = await search("cats"); // "cat illustration" does not start with "cats"
+    const result = await search("drawings");
     assert.deepEqual(result.hits.map((h) => [h.item.id, h.matchedFields]), [[id("Crayon2"), ["summary"]]]);
   });
 
@@ -147,9 +147,38 @@ describe("query handling", () => {
     assert.deepEqual(await ids("ramic"), []);
   });
 
-  test("an empty or punctuation-only query matches nothing", async () => {
+  test("an empty, punctuation-only or common-words-only query matches nothing", async () => {
     assert.deepEqual(await search(""), { total: 0, hits: [] });
     assert.deepEqual(await search("  #!? "), { total: 0, hits: [] });
+    assert.deepEqual(await search("the of a"), { total: 0, hits: [] });
+    assert.deepEqual(await search("a"), { total: 0, hits: [] }); // not a search for every word starting with "a"
+  });
+
+  test("short terms match whole words only, not the start of longer ones", async () => {
+    await addItem("Ui8", { sources: ["saved"], creator: { username: "uiuxmobile" }, caption: "fun app screens" });
+    await addItem("Ui9", { sources: ["saved"], caption: "kung fu poster for the #ui class" });
+    assert.deepEqual(await ids("ui"), ["Ui9"]);
+    assert.deepEqual(await ids("fu"), ["Ui9"]);
+    assert.deepEqual(await ids("uiux"), ["Ui8"]); // long enough to match as a prefix
+  });
+
+  test("singular and plural forms find each other", async () => {
+    await addItem("Cat8", { sources: ["saved"], caption: "my cat at the window" });
+    await addItem("Cat9", { sources: ["messages"], caption: "two cats asleep", at: "2026-09-02T00:00:00.000Z" });
+    await addItem("Box10", { sources: ["saved"], caption: "a box of stories" });
+    assert.deepEqual((await ids("cat")).sort(), ["Cat8", "Cat9", "Crayon2"]); // Crayon2: tag "cat illustration", summary "cats"
+    assert.deepEqual((await ids("cats")).sort(), ["Cat8", "Cat9", "Crayon2"]);
+    assert.deepEqual(await ids("boxes"), ["Box10"]);
+    assert.deepEqual(await ids("story"), ["Box10"]);
+    assert.deepEqual(await ids("category"), []); // "cat" no longer reaches into longer words
+  });
+
+  test("British and American spellings find each other, also inside hashtags", async () => {
+    await addItem("Colour8", { sources: ["saved"], caption: "#watercolourart grey skies" });
+    await addItem("Color9", { sources: ["saved"], ai: { tags: ["watercolor"], usefulFor: [] } });
+    assert.deepEqual((await ids("watercolour")).sort(), ["Color9", "Colour8"]);
+    assert.deepEqual((await ids("watercolor")).sort(), ["Color9", "Colour8"]);
+    assert.deepEqual(await ids("gray"), ["Colour8"]);
   });
 });
 
@@ -189,18 +218,35 @@ describe("ranking", () => {
   });
 
   test("a generic word repeated across AI fields does not outrank a literal caption match", async () => {
-    // "inspiration" is GenericAI8's type, summary and usefulFor: still only its best weight (1) counts.
+    // "inspiration" is GenericAI8's type, summary and usefulFor; next to "outfit" it doesn't count toward
+    // coverage, earns nothing in type or usefulFor, and at most 1 elsewhere.
     await addItem("GenericAI8", {
       sources: ["saved"], caption: "studio day",
       ai: { type: "inspiration", category: "design", summary: "A design inspiration post.", usefulFor: ["inspiration for layouts"] },
     });
     await addItem("Outfit10", { sources: ["messages"], caption: "outfit check for autumn" });
     const result = await search("outfit inspiration");
-    assert.deepEqual(result.hits.map((h) => [h.item.id, h.score, h.matchedFields.length]), [
-      [id("Outfit10"), 2, 1],
-      [id("GenericAI8"), 1, 3], // more fields, but a weaker match
-      [id("Crayon2"), 1, 1], // its type is "inspiration" too
+    assert.deepEqual(result.hits.map((h) => [h.item.id, h.matchedTerms, h.score, h.matchedFields.length]), [
+      [id("Outfit10"), 1, 2, 1],
+      [id("GenericAI8"), 0, 1, 3], // more fields, but only the generic word
+      [id("Crayon2"), 0, 0, 1], // its type is "inspiration" too: found, but last
     ]);
+  });
+
+  test("generic words do not match creator names, unless nothing else in the query does", async () => {
+    await addItem("Daily8", { sources: ["saved"], creator: { username: "daily.inspiration" }, caption: "app screens" });
+    await addItem("Sketch9", { sources: ["saved"], caption: "sketchbook spread with ideas for inspiration" });
+    assert.deepEqual(await ids("inspiration"), ["Sketch9", "Crayon2"]); // Crayon2: AI type "inspiration", found but unweighted
+    assert.deepEqual(await ids("sketchbook inspiration"), ["Sketch9", "Embroid1", "Crayon2"]); // Crayon2 by its type alone, last
+    assert.equal((await ids("daily inspiration"))[0], "Daily8"); // a non-generic word still finds the creator
+  });
+
+  test("boilerplate in usefulFor weighs least: a caption or tag match of the same words ranks first", async () => {
+    await addItem("Boiler8", { sources: ["saved"], caption: "beach day", ai: { tags: ["travel"], usefulFor: ["color palette reference"] } });
+    await addItem("Palette9", { sources: ["saved"], caption: "my favourite colour palette" });
+    const ranked = (await search("color palette reference")).hits.map((h) => h.item.id);
+    assert.equal(ranked[0], id("Palette9"));
+    assert.ok(ranked.indexOf(id("Boiler8")) > 0);
   });
 
   test("caption-less items stay discoverable through their AI tags and summary", async () => {
@@ -214,14 +260,23 @@ describe("ranking", () => {
   });
 
   test("at equal coverage and score, matching in more fields ranks higher", async () => {
-    // "glaze reference": Ceramic5 matches both terms. For "reference" alone, LikedSaved4 matches in type and
-    // usefulFor, Crayon2 only in usefulFor: same best weight (1), so corroboration decides.
-    const result = await search("glaze reference");
-    assert.deepEqual(result.hits.map((h) => [h.item.id, h.matchedTerms, h.score, h.matchedFields.length]), [
-      [id("Ceramic5"), 2, 4, 4],
-      [id("LikedSaved4"), 1, 1, 2],
-      [id("Crayon2"), 1, 1, 1],
-    ]);
+    // "craft": LikedSaved4 and Ceramic5 both match only their category (weight 1); a summary mention adds corroboration.
+    await addItem("Craft8", {
+      sources: ["saved"], at: "2026-09-30T00:00:00.000Z",
+      ai: { category: "craft", summary: "A craft fair stall.", tags: [], usefulFor: [] },
+    });
+    const result = await search("craft");
+    assert.deepEqual(result.hits.map((h) => [h.item.id, h.score, h.matchedFields.length])[0], [id("Craft8"), 1, 2]);
+  });
+
+  test("recency only breaks exact ties: an older, more complete match beats a newer partial one", async () => {
+    await addItem("OldFull8", { sources: ["saved"], caption: "teal lantern by the door", at: "2020-01-01T00:00:00.000Z" });
+    await addItem("NewPartial9", { sources: ["saved"], caption: "teal sky", at: "2026-09-30T00:00:00.000Z" });
+    await addItem("NewTie10", { sources: ["saved"], caption: "lantern festival", at: "2026-09-29T00:00:00.000Z" });
+    await addItem("OldTie11", { sources: ["saved"], caption: "paper lantern", at: "2021-01-01T00:00:00.000Z" });
+    // "lantern teal": no phrase anywhere, so coverage then recency decide.
+    assert.deepEqual(await ids("lantern teal"), ["OldFull8", "NewPartial9", "NewTie10", "OldTie11"]);
+    assert.deepEqual(await ids("lantern"), ["NewTie10", "OldTie11", "OldFull8"]);
   });
 
   test("a creator match still ranks above caption-only matches when no organization matches", async () => {
@@ -243,12 +298,80 @@ describe("ranking", () => {
   });
 });
 
+describe("phrases", () => {
+  test("words that occur together rank above the same words apart", async () => {
+    await addItem("Apart8", { sources: ["saved"], caption: "a stitch in time, cross the road", at: "2026-09-30T00:00:00.000Z" });
+    await addItem("Together9", { sources: ["saved"], caption: "my cross stitch phone case", at: "2020-01-01T00:00:00.000Z" });
+    const result = await search("cross stitch");
+    assert.deepEqual(result.hits.slice(0, 2).map((h) => [h.item.id, h.matchedTerms, h.phraseScore]), [
+      [id("Together9"), 2, 3],
+      [id("Apart8"), 2, 0],
+    ]);
+  });
+
+  test("a hashtag joining the words counts as the phrase", async () => {
+    await addItem("Hashtag8", { sources: ["saved"], caption: "new kit out #crossstitch and stitch markers" });
+    await addItem("Apart9", { sources: ["saved"], caption: "stitch then cross over", at: "2026-09-30T00:00:00.000Z" });
+    assert.deepEqual((await ids("cross stitch")).slice(0, 2), ["Hashtag8", "Apart9"]);
+  });
+
+  test("common words may sit inside a phrase", async () => {
+    await addItem("Bw8", { sources: ["saved"], caption: "black and white film" });
+    await addItem("Bw9", { sources: ["saved"], caption: "white walls, black floor", at: "2026-09-30T00:00:00.000Z" });
+    assert.deepEqual(await ids("black and white"), ["Bw8", "Bw9"]);
+  });
+
+  test("a caption phrase outranks an AI tag phrase on a captioned item; a caption-less item's tags stand in for a caption", async () => {
+    await addItem("TagPhrase8", {
+      sources: ["saved"], caption: "tiny sketchbook page", at: "2026-09-30T00:00:00.000Z",
+      ai: { tags: ["cross stitch"], usefulFor: [] },
+    });
+    await addItem("CaptionPhrase9", { sources: ["saved"], caption: "my cross stitch phone case", at: "2020-01-01T00:00:00.000Z" });
+    await addItem("NoCaption10", { sources: ["saved"], ai: { tags: ["cross stitch", "hoop art"], summary: "A cross stitch hoop.", usefulFor: [] } });
+    const result = await search("cross stitch");
+    assert.deepEqual(result.hits.slice(0, 3).map((h) => [h.item.id, h.phraseScore]), [
+      [id("NoCaption10"), 3], // as strong a phrase as a caption's, and a higher score (tags)
+      [id("CaptionPhrase9"), 3],
+      [id("TagPhrase8"), 2], // the AI added the phrase; the caption doesn't say it
+    ]);
+  });
+
+  test("phrases do not run from one tag into the next", async () => {
+    await addItem("Tags8", { sources: ["saved"], ai: { tags: ["tiny cross", "stitch markers"], usefulFor: [] } });
+    const result = await search("cross stitch");
+    assert.equal(result.hits.find((h) => h.item.id === id("Tags8"))?.phraseScore, 0);
+  });
+});
+
 describe("query parsing", () => {
   test("normalizes, drops common words and duplicates, caps the term count, and marks CJK terms", () => {
     assert.equal(normalizeSearchText("  Café—ÉTÉ #crayonArt!! "), "café été crayonart");
-    assert.deepEqual(parseSearchQuery("The Embroidery, embroidery & floral ideas").map((t) => t.text), ["embroidery", "floral", "ideas"]);
-    assert.deepEqual(parseSearchQuery("the of a").map((t) => t.text), ["the", "of", "a"]); // nothing else left: keep them
-    assert.equal(parseSearchQuery("a b c d e f g h i j k").length, 8);
-    assert.deepEqual(parseSearchQuery("귀여운 cat"), [{ text: "귀여운", anywhere: true }, { text: "cat", anywhere: false }]);
+    assert.equal(searchText("Watercolour, GREY & Colourful"), "watercolor gray colorful");
+    const terms = (q: string) => planSearch(q).terms.map((t) => t.text);
+    assert.deepEqual(terms("The Embroidery, embroidery & floral ideas"), ["embroidery", "floral", "ideas"]);
+    assert.deepEqual(terms("the of a"), []); // nothing meaningful: no search
+    assert.equal(terms("aa bb cc dd ee ff gg hh ii jj kk").length, 8);
+    assert.deepEqual(planSearch("귀여운 cat").terms.map((t) => [t.text, t.variants.map((v) => v.mode)]), [
+      ["귀여운", ["anywhere"]],
+      ["cat", ["word", "word", "word"]], // cat, cats, cates
+    ]);
+  });
+
+  test("generic words count only when the query has nothing else", () => {
+    assert.deepEqual(planSearch("sketchbook ideas").terms.map((t) => [t.text, t.generic, t.counts]), [
+      ["sketchbook", false, true],
+      ["ideas", true, false],
+    ]);
+    assert.deepEqual(planSearch("ideas").terms.map((t) => [t.text, t.counts]), [["ideas", true]]);
+    assert.equal(planSearch("sketchbook ideas").phrases.length, 0); // a generic word joins no phrase
+  });
+
+  test("singular forms", () => {
+    assert.deepEqual(singularForms("cats"), ["cat"]);
+    assert.deepEqual(singularForms("stories"), ["story", "storie"]);
+    assert.deepEqual(singularForms("boxes"), ["box", "boxe"]);
+    assert.deepEqual(singularForms("glass"), []);
+    assert.deepEqual(singularForms("paris"), []);
+    assert.deepEqual(singularForms("bus"), []); // too short to guess
   });
 });

@@ -22,10 +22,17 @@ import type {
 } from "../../domain/archive-item.ts";
 import type { MediaRetrievalRequest } from "../../domain/media-retrieval.ts";
 import {
-  normalizeSearchText,
+  NON_CORROBORATING_FIELDS,
+  CAPTIONED_TAG_PHRASE_WEIGHT,
   ORGANIZATION_SEARCH_FIELDS,
-  parseSearchQuery,
+  PHRASE_FIELD_WEIGHTS,
+  planSearch,
   SEARCH_FIELD_WEIGHTS,
+  searchText,
+  searchTextOfList,
+  termFieldRule,
+  type MatchText,
+  type PhraseField,
   type SearchField,
 } from "../../search/search-query.ts";
 import {
@@ -51,9 +58,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   constructor(db: DatabaseSync) {
     this.db = db;
     // Unicode-aware normalization for search (SQLite's lower() is ASCII-only).
-    db.function("search_norm", { deterministic: true }, (value) =>
-      normalizeSearchText(typeof value === "string" ? value : null),
-    );
+    db.function("search_norm", { deterministic: true }, (value) => searchText(typeof value === "string" ? value : null));
+    // A JSON array (tags, usefulFor) as searched text, entries kept apart so phrases don't span them.
+    db.function("search_norm_list", { deterministic: true }, (value) => {
+      if (typeof value !== "string") return "";
+      try {
+        const parsed: unknown = JSON.parse(value);
+        return Array.isArray(parsed) ? searchTextOfList(parsed) : searchText(value);
+      } catch {
+        return searchText(value);
+      }
+    });
   }
 
   async withTransaction<T>(work: (repo: ArchiveRepository) => Promise<T>): Promise<T> {
@@ -422,24 +437,54 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     query: string,
     options: { sources: readonly SourceKind[]; limit?: number; offset?: number },
   ): Promise<{ total: number; hits: ArchiveSearchHit[] }> {
-    const terms = parseSearchQuery(query);
+    const { terms, phrases } = planSearch(query);
     if (terms.length === 0) return { total: 0, hits: [] };
 
     const fields = Object.keys(SEARCH_FIELD_WEIGHTS) as SearchField[];
     const params: Record<string, string> = { owner_id: ownerId };
-    // matches(field, term): the term starts a word in the field (or occurs anywhere, for CJK terms).
-    const matches = (field: SearchField, i: number) =>
-      terms[i]?.anywhere ? `(instr(d.${field}, :t${i}) > 0)` : `(instr(' ' || d.${field}, ' ' || :t${i}) > 0)`;
-    terms.forEach((term, i) => (params[`t${i}`] = term.text));
-    const anyOf = (searched: readonly SearchField[], i: number) => `(${searched.map((f) => matches(f, i)).join(" OR ")})`;
+    const param = (text: string) => {
+      const key = `p${Object.keys(params).length}`;
+      params[key] = text;
+      return `:${key}`;
+    };
+    // matches(column, variants): any variant occurs anywhere (CJK), starts a word, or is a whole word.
+    const matches = (column: string, variants: readonly MatchText[]) => {
+      const one = ({ text, mode }: MatchText) => {
+        const p = param(text);
+        if (mode === "anywhere") return `instr(${column}, ${p}) > 0`;
+        if (mode === "prefix") return `instr(' ' || ${column}, ' ' || ${p}) > 0`;
+        return `instr(' ' || ${column} || ' ', ' ' || ${p} || ' ') > 0`;
+      };
+      return `(${variants.map(one).join(" OR ")})`;
+    };
+    const or = (parts: string[]) => (parts.length > 0 ? `(${parts.join(" OR ")})` : "0");
+    const sum = (parts: string[]) => (parts.length > 0 ? parts.join(" + ") : "0");
+
+    // One 0/1 column per (term, field) the term is looked for in, and per (phrase, field).
+    const termCols: string[] = [];
+    const col = (i: number, f: SearchField) => `m${i}_${f}`;
+    terms.forEach((term, i) => {
+      for (const f of fields) if (termFieldRule(term, f)) termCols.push(`${matches(`d.${f}`, term.variants)} AS ${col(i, f)}`);
+    });
+    const phraseFields = Object.keys(PHRASE_FIELD_WEIGHTS) as PhraseField[];
+    const phraseCols = phrases.flatMap((phrase, k) => phraseFields.map((f) => `${matches(`d.${f}`, phrase.variants)} AS ph${k}_${f}`));
+    const has = (i: number, f: SearchField) => termFieldRule(terms[i]!, f) !== undefined;
+
     // Each term counts once, with the weight of the best field it matched.
-    const score = terms
-      .map((_, i) => `max(${fields.map((f) => `${SEARCH_FIELD_WEIGHTS[f]} * ${matches(f, i)}`).join(", ")})`)
-      .join(" + ");
-    const matchedTerms = terms.map((_, i) => anyOf(fields, i)).join(" + ");
-    const organizationTerms = terms.map((_, i) => anyOf(ORGANIZATION_SEARCH_FIELDS, i)).join(" + ");
-    const fieldHits = fields.map((f) => `(${terms.map((_, i) => matches(f, i)).join(" OR ")}) AS hit_${f}`).join(", ");
-    const fieldCount = fields.map((f) => `hit_${f}`).join(" + ");
+    const score = sum(terms.map((term, i) =>
+      `max(0, ${fields.filter((f) => has(i, f)).map((f) => `${termFieldRule(term, f)!.weight} * ${col(i, f)}`).join(", ")})`));
+    // Coverage: the terms matched in a field that counts for them.
+    const matchedTerms = sum(terms.map((term, i) => or(fields.filter((f) => termFieldRule(term, f)?.covers).map((f) => col(i, f)))));
+    const organizationTerms = sum(terms.map((_, i) => or(ORGANIZATION_SEARCH_FIELDS.filter((f) => has(i, f)).map((f) => col(i, f)))));
+    const fieldHits = fields.map((f) => `${or(terms.flatMap((_, i) => (has(i, f) ? [col(i, f)] : [])))} AS hit_${f}`);
+    const found = or(terms.flatMap((_, i) => fields.filter((f) => has(i, f)).map((f) => col(i, f))));
+    // Corroboration: fields (other than assist-only ones) matching a term that counts.
+    const corroboration = sum(fields.filter((f) => !NON_CORROBORATING_FIELDS.includes(f)).map((f) =>
+      or(terms.flatMap((term, i) => (term.counts && has(i, f) ? [col(i, f)] : [])))));
+    // Each phrase counts once, with the weight of the best field it occurs in.
+    const phraseWeight = (f: PhraseField) =>
+      f === "tags" ? `(CASE WHEN m.caption = '' THEN ${PHRASE_FIELD_WEIGHTS.tags} ELSE ${CAPTIONED_TAG_PHRASE_WEIGHT} END)` : `${PHRASE_FIELD_WEIGHTS[f]}`;
+    const phraseScore = sum(phrases.map((_, k) => `max(0, ${phraseFields.map((f) => `${phraseWeight(f)} * ph${k}_${f}`).join(", ")})`));
 
     const rows = this.db
       .prepare(
@@ -463,20 +508,25 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              search_norm(json_extract(s.org, '$.type')) AS type,
              search_norm(json_extract(s.org, '$.category')) AS category,
              search_norm(json_extract(s.org, '$.summary')) AS summary,
-             search_norm(json_extract(s.org, '$.tags')) AS tags,
-             search_norm(json_extract(s.org, '$.usefulFor')) AS usefulFor
+             search_norm_list(json_extract(s.org, '$.tags')) AS tags,
+             search_norm_list(json_extract(s.org, '$.usefulFor')) AS usefulFor
            FROM scoped s
          ),
+         matched AS MATERIALIZED (
+           SELECT d.id, d.caption, ${[...termCols, ...phraseCols].join(", ")} FROM docs d
+         ),
          scored AS (
-           SELECT d.id, ${organizationTerms} AS organization_terms, ${matchedTerms} AS matched_terms,
-             ${score} AS score, ${fieldHits},
-             (SELECT MAX(occurred_at) FROM source_records r WHERE r.archive_item_id = d.id) AS latest_at
-           FROM docs d
+           SELECT m.id, ${found} AS found, ${organizationTerms} AS organization_terms, ${matchedTerms} AS matched_terms,
+             ${score} AS score, ${phraseScore} AS phrase_score, ${corroboration} AS corroboration, ${fieldHits.join(", ")},
+             (SELECT MAX(occurred_at) FROM source_records r WHERE r.archive_item_id = m.id) AS latest_at
+           FROM matched m
          )
-         SELECT *, ${fieldCount} AS field_count FROM scored WHERE matched_terms > 0
-         ORDER BY matched_terms DESC, score DESC, field_count DESC, latest_at DESC NULLS LAST, id`,
+         SELECT * FROM scored WHERE found
+         ORDER BY matched_terms DESC, phrase_score DESC, score DESC, corroboration DESC, latest_at DESC NULLS LAST, id`,
       )
-      .all(params) as ({ id: string; organization_terms: number; matched_terms: number; score: number } & Record<string, unknown>)[];
+      .all(params) as ({
+        id: string; organization_terms: number; matched_terms: number; score: number; phrase_score: number;
+      } & Record<string, unknown>)[];
 
     const offset = options.offset ?? 0;
     const page = rows.slice(offset, offset + (options.limit ?? 100));
@@ -487,6 +537,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       hits.push({
         item,
         score: row.score,
+        phraseScore: row.phrase_score,
         matchedTerms: row.matched_terms,
         organizationTerms: row.organization_terms,
         matchedFields: fields.filter((f) => row[`hit_${f}`] === 1),

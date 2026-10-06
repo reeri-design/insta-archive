@@ -114,14 +114,17 @@ export interface ArchiveRepository {
   /**
    * Keyword search over the creator, caption and the item's organization
    * (the curated one if reviewed, else the latest AI suggestion): type,
-   * category, tags, summary and usefulFor. Case-insensitive; terms match the
-   * start of words (see parseSearchQuery). Ranking, in order: how many
-   * distinct query terms match anywhere, the score (each term's best field
-   * weight, summed), how many fields matched (corroboration), then most
-   * recent. AI fields assist but cannot, through generic words, outrank a
-   * more complete or stronger literal match.
+   * category, tags, summary and usefulFor. Case-insensitive, with American
+   * spellings and light singular forms; terms match the start of words, and
+   * short terms whole words only (see planSearch). Ranking, in order: how
+   * many distinct query terms match (coverage; generic words like "ideas"
+   * only when the query has nothing else, usefulFor never), whether
+   * neighbouring terms occur together as a phrase, the score (each term's
+   * best field weight, summed), how many fields matched (corroboration),
+   * then most recent. AI fields assist but cannot, through generic words or
+   * boilerplate, outrank a more complete or stronger literal match.
    * Only items with a source record of one of `sources` are searched.
-   * An empty query matches nothing.
+   * An empty query, or one of only common words, matches nothing.
    */
   searchArchiveItems(
     ownerId: UserId,
@@ -153,7 +156,9 @@ export type ArchiveSearchHit = {
   item: ArchiveItem;
   /** Sum over matched terms of the weight of each term's best field (see SEARCH_FIELD_WEIGHTS). */
   score: number;
-  /** How many distinct query terms matched somewhere. */
+  /** Sum over neighbouring query-term pairs of the weight of the best field they occur in together (see PHRASE_FIELD_WEIGHTS). */
+  phraseScore: number;
+  /** How many distinct query terms matched in a field that counts toward coverage. */
   matchedTerms: number;
   /** How many distinct query terms matched the item's organization (ORGANIZATION_SEARCH_FIELDS). */
   organizationTerms: number;
