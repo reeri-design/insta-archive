@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { archiveDatabasePath } from "../../config/data-source.ts";
 import { MIGRATIONS } from "./migrations.ts";
 
 /**
@@ -17,13 +18,15 @@ export function openDatabase(path: string): DatabaseSync {
   return db;
 }
 
-/** Path from DATABASE_PATH (see .env.example), resolved against the cwd. */
+/**
+ * The selected archive's database (see src/config/data-source.ts): DATABASE_PATH
+ * for the personal archive (the default), DEMO_DATABASE_PATH for the demo one;
+ * resolved against the cwd. Refuses configurations where the two overlap.
+ */
 export function databasePathFromEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
-  const path = env.DATABASE_PATH;
-  if (!path) throw new Error("DATABASE_PATH is not set (see .env.example)");
-  return resolve(path);
+  return archiveDatabasePath(env);
 }
 
 export function migrate(db: DatabaseSync): void {

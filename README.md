@@ -31,6 +31,29 @@ npm test
 npm run build
 ```
 
+## Personal and demo archives
+
+The app works on one of two archives, chosen by `ARCHIVE_DATA_SOURCE` (`src/config/data-source.ts`):
+
+| | Personal (default) | Demo |
+|---|---|---|
+| Select | nothing to set | `ARCHIVE_DATA_SOURCE=demo` (the `*:demo` scripts set it) |
+| Database | `DATABASE_PATH` (`./data/insta-archive.sqlite`) | `DEMO_DATABASE_PATH` (default `./demo-data/archive.sqlite`) |
+| Media | `MEDIA_STORAGE_DIR` (`./data/media`) | `DEMO_MEDIA_STORAGE_DIR` (default `./demo-data/media`) |
+
+```bash
+npm run dev                    # personal archive, http://localhost:3000 (unchanged)
+
+npm run demo:seed              # create/refresh the demo archive (tiny placeholder data); --reset to start over
+npm run dev:demo               # demo archive, http://localhost:3001
+npm run build && npm run start:demo   # or a production server on the demo archive
+```
+
+- The two never share a location: every database and media path is resolved in one place, and a configuration where the demo archive's database, its folder, or its media would equal, contain or sit inside the personal archive's (or the other way round) is refused in either mode.
+- `demo:seed` refuses to run unless the demo archive is selected; it imports the repository's own synthetic test export and a few generated placeholder images — nothing from a personal archive. `/demo-data/` is git-ignored.
+- The CLIs (`import:instagram`, `retrieve:media`, `enrich:ai`, …) follow the same selection; personal is the default. An explicit `--database <path>` still overrides it.
+- Run one `next dev` per checkout at a time (they share `.next/`); to have both archives open, use `npm run build && npm run start:demo` beside `npm run dev`.
+
 ## Importing an Instagram export
 
 Request a JSON-format "Download your information" export from Instagram and unzip it somewhere **outside this project**. Then run:

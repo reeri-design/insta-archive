@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { archiveMediaDir } from "../config/data-source.ts";
 import {
   MediaStorageConflictError,
   sha256,
@@ -60,11 +61,13 @@ export class LocalMediaStorage implements MediaStorage {
   }
 }
 
-/** MEDIA_STORAGE_DIR (see .env.example), resolved against the cwd. */
+/**
+ * The selected archive's media directory (see src/config/data-source.ts):
+ * MEDIA_STORAGE_DIR for the personal archive (the default),
+ * DEMO_MEDIA_STORAGE_DIR for the demo one; resolved against the cwd.
+ */
 export function mediaStorageDirFromEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
-  const dir = env.MEDIA_STORAGE_DIR;
-  if (!dir) throw new Error("MEDIA_STORAGE_DIR is not set (see .env.example)");
-  return resolve(dir);
+  return archiveMediaDir(env);
 }

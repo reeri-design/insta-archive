@@ -11,7 +11,7 @@ src/persistence/
 ```
 
 - **Driver:** Node's built-in `node:sqlite`, with no npm dependency and no ORM. It still prints an "experimental" warning on Node 24. Only `sqlite/` knows about it, so swapping in `better-sqlite3` or another database touches nothing else.
-- **Location:** `DATABASE_PATH` (default `./data/insta-archive.sqlite`, which is git-ignored). Tests use `:memory:` or a temp directory and never read `DATABASE_PATH`.
+- **Location:** `DATABASE_PATH` (default `./data/insta-archive.sqlite`, which is git-ignored) for the personal archive; `DEMO_DATABASE_PATH` (default `./demo-data/archive.sqlite`) for the demo archive. Which one is used is decided in `src/config/data-source.ts` (`ARCHIVE_DATA_SOURCE`, personal by default; see the README). Tests use `:memory:` or a temp directory and never read `DATABASE_PATH`.
 - **Connection settings:** `foreign_keys = ON`, WAL journal and `busy_timeout = 5000`, set on every connection.
 
 ## Tables

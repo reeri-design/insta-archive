@@ -667,6 +667,7 @@ describe("database", () => {
 
   test("DATABASE_PATH is required and resolved", () => {
     assert.throws(() => databasePathFromEnv({}), /DATABASE_PATH is not set/);
-    assert.equal(databasePathFromEnv({ DATABASE_PATH: "/tmp/x.sqlite" }), "/tmp/x.sqlite");
+    // A path that cannot contain the checkout (and so its default demo archive): see src/config/data-source.ts.
+    assert.equal(databasePathFromEnv({ DATABASE_PATH: "/archive-test/x.sqlite" }), "/archive-test/x.sqlite");
   });
 });

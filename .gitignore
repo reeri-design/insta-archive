@@ -43,6 +43,8 @@ next-env.d.ts
 
 # local archive data (SQLite databases, downloaded media, Instagram exports)
 /data/
+# the seeded demo archive (npm run demo:seed)
+/demo-data/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

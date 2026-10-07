@@ -1,6 +1,8 @@
 /**
- * Server-side wiring for the web app: the configured archive repository and
- * media storage (DATABASE_PATH, MEDIA_STORAGE_DIR). Import only from server
+ * Server-side wiring for the web app: the selected archive's repository and
+ * media storage — the personal archive (DATABASE_PATH, MEDIA_STORAGE_DIR) by
+ * default, or the demo one with ARCHIVE_DATA_SOURCE=demo (see
+ * src/config/data-source.ts). Import only from server
  * code (pages, route handlers, server actions).
  */
 import type { DatabaseSync } from "node:sqlite";

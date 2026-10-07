@@ -59,6 +59,7 @@ describe("LocalMediaStorage", () => {
 
   test("MEDIA_STORAGE_DIR is required", () => {
     assert.throws(() => mediaStorageDirFromEnv({}), /MEDIA_STORAGE_DIR is not set/);
-    assert.equal(mediaStorageDirFromEnv({ MEDIA_STORAGE_DIR: "/tmp/m" }), "/tmp/m");
+    // A path that cannot contain the checkout (and so its default demo archive): see src/config/data-source.ts.
+    assert.equal(mediaStorageDirFromEnv({ MEDIA_STORAGE_DIR: "/archive-test/m" }), "/archive-test/m");
   });
 });
