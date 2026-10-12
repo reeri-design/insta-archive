@@ -215,6 +215,19 @@ describe("archive items", () => {
       assert.ok(await repo.getArchiveItemAggregate(item("likedOnly")));
     });
 
+    test("paging listArchiveItems with a sources filter returns each item exactly once", async () => {
+      // A regression for SQLite 3.51's EXISTS-to-join optimization: OFFSET counted every matching
+      // source record, so an item with two (saved + messages) made the next pages overlap.
+      await repo.addSourceRecords([makeSource("savedOnly:messages", item("savedOnly"), { source: "messages" })]);
+      for (const order of ["created", "recent"] as const) {
+        const paged: string[] = [];
+        for (let offset = 0; offset < IN_SCOPE.length + 1; offset++) {
+          paged.push(...(await repo.listArchiveItems(OWNER, { sources: MAIN_ARCHIVE_SOURCES, order, limit: 1, offset })).map((i) => i.id));
+        }
+        assert.deepEqual(sorted(paged), IN_SCOPE, order);
+      }
+    });
+
     test("AI enrichment candidates with MAIN_ARCHIVE_SOURCES exclude liked-only items", async () => {
       const candidates = await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES });
       assert.deepEqual(sorted(candidates.map((c) => c.itemId)), IN_SCOPE);

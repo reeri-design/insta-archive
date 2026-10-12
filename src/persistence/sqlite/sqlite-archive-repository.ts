@@ -923,10 +923,14 @@ const SOURCE_KINDS: readonly SourceKind[] = ["messages", "saved", "liked"];
  * "AND the item has a source record of one of these kinds", or nothing when
  * no kinds are given. Kinds are checked against the known set before being
  * written into the SQL.
+ *
+ * The LIMIT 1 is required, not cosmetic: without it SQLite 3.51's EXISTS-to-join
+ * optimization lets OFFSET count every matching source record instead of every
+ * item, so pages overlap for items with several (e.g. saved + messages).
  */
 function sourceFilter(itemIdColumn: string, sources: readonly SourceKind[] | undefined): string {
   if (!sources) return "";
-  return `AND EXISTS (SELECT 1 FROM source_records sf WHERE sf.archive_item_id = ${itemIdColumn} ${sourceKindCondition("sf", sources)})`;
+  return `AND EXISTS (SELECT 1 FROM source_records sf WHERE sf.archive_item_id = ${itemIdColumn} ${sourceKindCondition("sf", sources)} LIMIT 1)`;
 }
 
 /** "AND <alias>.source IN (...)" for the given kinds, or nothing when none are given. */
