@@ -650,6 +650,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return rows.map((row) => this.toItem(row));
   }
 
+  async listArchiveItemIds(ownerId: UserId, options: { sources?: readonly SourceKind[] } = {}): Promise<ArchiveItemId[]> {
+    const rows = this.db
+      .prepare(`SELECT id FROM archive_items WHERE owner_id = ? ${sourceFilter("archive_items.id", options.sources)} ORDER BY id`)
+      .all(ownerId) as { id: string }[];
+    return rows.map((r) => r.id as ArchiveItemId);
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------

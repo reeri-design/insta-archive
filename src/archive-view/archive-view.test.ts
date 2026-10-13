@@ -12,10 +12,12 @@ import { storageKeyFor } from "../media/media-storage.ts";
 import { openDatabase } from "../persistence/sqlite/database.ts";
 import { SqliteArchiveRepository } from "../persistence/sqlite/sqlite-archive-repository.ts";
 import {
+  getArchiveCard,
   getItemDetail,
   identityFromKey,
   itemKey,
   listArchiveCards,
+  listShuffledArchiveCards,
   readItemMedia,
   saveItemReview,
   searchArchiveCards,
@@ -130,6 +132,25 @@ describe("search", () => {
   });
 });
 
+describe("shuffle", () => {
+  test("a selection is distinct main-archive cards, the whole (small) archive here, the same for the same seed", async () => {
+    const all = (await listArchiveCards(repo, OWNER, { pageSize: 50 })).cards.map((c) => c.key).sort();
+    const shuffled = await listShuffledArchiveCards(repo, OWNER, { seed: "abc" });
+    assert.deepEqual(shuffled.map((c) => c.key).sort(), all);
+    assert.ok(!shuffled.some((c) => c.key === "PostCCC333")); // liked-only stays out
+    assert.deepEqual(await listShuffledArchiveCards(repo, OWNER, { seed: "abc" }), shuffled);
+    assert.deepEqual(await listShuffledArchiveCards(repo, OTHER, { seed: "abc" }), []); // per owner
+  });
+
+  test("each call without a seed is a fresh selection, so successive Shuffles can differ", async () => {
+    const pick = async () => (await listShuffledArchiveCards(repo, OWNER, { size: 1 })).map((c) => c.key).join();
+    const picks = new Set<string>();
+    for (let i = 0; i < 20; i++) picks.add(await pick());
+    assert.ok(picks.size > 1, "fresh selections differ");
+    assert.ok(![...picks].includes("PostCCC333")); // liked-only stays out
+  });
+});
+
 describe("main archive scope (Saved + Messages)", () => {
   test("a liked-only item is left out of the grid, detail, media and review; its data stays stored", async () => {
     // Fixtures: PostCCC333 is liked-only; ReelAAA111 is saved + messages + liked.
@@ -139,6 +160,72 @@ describe("main archive scope (Saved + Messages)", () => {
     assert.equal(await getItemDetail(repo, OWNER, "PostCCC333"), undefined);
     await assert.rejects(saveItemReview(repo, OWNER, "PostCCC333", reviewInputFrom(undefined), T1), /No archive item/);
     assert.ok(await repo.getArchiveItemAggregate(id("PostCCC333"))); // still in storage
+  });
+});
+
+describe("library media facts", () => {
+  test("previews carry stored dimensions only when recorded (never guessed)", async () => {
+    const assetId = `${id("CarouBBB222")}:media:0` as MediaAssetId;
+    const key = storageKeyFor(id("CarouBBB222"), assetId, "image/jpeg");
+    await storage.put(key, new TextEncoder().encode("slide"));
+    const save = (dims: { width?: number; height?: number }) => repo.saveMediaAssets([{
+      id: assetId, archiveItemId: id("CarouBBB222"), mediaType: "image", role: "content", position: 0,
+      retrieval: { status: "stored", storageKey: key, mimeType: "image/jpeg", retrievedAt: T0, ...dims },
+    }]);
+    const preview = async () => (await listArchiveCards(repo, OWNER, { pageSize: 50 })).cards.find((c) => c.href === "/items/CarouBBB222")?.preview;
+    await save({});
+    assert.deepEqual(await preview(), { mediaType: "image", url: "/items/CarouBBB222/media/media%3A0" });
+    await save({ width: 1080 }); // half a size is not a size
+    assert.deepEqual(await preview(), { mediaType: "image", url: "/items/CarouBBB222/media/media%3A0" });
+    await save({ width: 1080, height: 1350 });
+    assert.deepEqual(await preview(), { mediaType: "image", url: "/items/CarouBBB222/media/media%3A0", width: 1080, height: 1350 });
+  });
+
+  test("media state: available, not retrieved yet, failed (to be retried), or unavailable", async () => {
+    const stateOf = async (sc: string) => (await listArchiveCards(repo, OWNER, { pageSize: 50 })).cards.find((c) => c.href === `/items/${sc}`)?.mediaState;
+    assert.equal(await stateOf("ReelAAA111"), "pending"); // no retrieval request yet
+    const base = { priority: 0, attempts: 1, createdAt: T0, updatedAt: T0, lastAttemptAt: T0 };
+    await repo.saveMediaRetrievalRequest({ ...base, archiveItemId: id("ReelAAA111"), status: "pending", attempts: 0 });
+    assert.equal(await stateOf("ReelAAA111"), "pending");
+    await repo.saveMediaRetrievalRequest({ ...base, archiveItemId: id("ReelAAA111"), status: "failed", nextAttemptAt: T1, lastFailure: { kind: "temporary", code: "server_error", message: "HTTP 500" } });
+    assert.equal(await stateOf("ReelAAA111"), "failed");
+    await repo.saveMediaRetrievalRequest({ ...base, archiveItemId: id("ReelAAA111"), status: "unavailable", lastFailure: { kind: "unavailable", code: "not_found", message: "removed" } });
+    assert.equal(await stateOf("ReelAAA111"), "unavailable");
+    await storeSlide(0, "slide");
+    assert.equal(await stateOf("CarouBBB222"), "available");
+  });
+});
+
+describe("focus media", () => {
+  test("a carousel shows its stored slides in order; a missing slide is skipped", async () => {
+    await storeSlide(2, "slide 2");
+    await storeSlide(0, "slide 0");
+    await storeSlide(1, "slide 1", "failed");
+    const card = await getArchiveCard(repo, OWNER, "CarouBBB222");
+    assert.equal(card?.key, "CarouBBB222");
+    assert.match(card?.sourceUrl ?? "", /^https:\/\/www\.instagram\.com\/p\/CarouBBB222\/?$/);
+    assert.deepEqual(card?.viewable.map((m) => [m.role, m.url]), [
+      ["content", "/items/CarouBBB222/media/media%3A0"],
+      ["content", "/items/CarouBBB222/media/media%3A2"],
+    ]);
+  });
+
+  test("a Reel without its video shows the cover, labelled as the cover; no media means nothing to show", async () => {
+    const reel = id("ReelAAA111");
+    assert.deepEqual((await getArchiveCard(repo, OWNER, "ReelAAA111"))?.viewable, []);
+    const coverId = `${reel}:cover` as MediaAssetId;
+    const key = storageKeyFor(reel, coverId, "image/jpeg");
+    await storage.put(key, new TextEncoder().encode("cover"));
+    await repo.saveMediaAssets([{ id: coverId, archiveItemId: reel, mediaType: "image", role: "cover", retrieval: { status: "stored", storageKey: key, mimeType: "image/jpeg", retrievedAt: T0, width: 720, height: 1280 } }]);
+    assert.deepEqual((await getArchiveCard(repo, OWNER, "ReelAAA111"))?.viewable, [
+      { mediaType: "image", url: "/items/ReelAAA111/media/cover", width: 720, height: 1280, role: "cover" },
+    ]);
+  });
+
+  test("only the owner's main-archive items can be focused", async () => {
+    assert.equal(await getArchiveCard(repo, OTHER, "CarouBBB222"), undefined);
+    assert.equal(await getArchiveCard(repo, OWNER, "PostCCC333"), undefined); // liked-only
+    assert.equal(await getArchiveCard(repo, OWNER, "NoSuchItem1"), undefined);
   });
 });
 
@@ -175,7 +262,7 @@ describe("detail", () => {
     await repo.saveMediaAssets([{ id: coverId, archiveItemId: reel, mediaType: "image", role: "cover", retrieval: { status: "stored", storageKey: key, mimeType: "image/jpeg", retrievedAt: T0 } }]);
 
     const card = (await listArchiveCards(repo, OWNER, { pageSize: 50 })).cards.find((c) => c.href === "/items/ReelAAA111");
-    assert.deepEqual([card?.preview, card?.storedMediaCount], [{ mediaType: "image", url: "/items/ReelAAA111/media/cover" }, 0]);
+    assert.deepEqual([card?.preview, card?.storedMediaCount, card?.mediaState], [{ mediaType: "image", url: "/items/ReelAAA111/media/cover", cover: true }, 0, "available"]);
     const detail = await getItemDetail(repo, OWNER, "ReelAAA111");
     assert.deepEqual([detail?.media, detail?.cover], [[], { mediaType: "image", url: "/items/ReelAAA111/media/cover" }]);
     assert.deepEqual(detail?.missingMedia, [{ position: 0, mediaType: "video", status: "unavailable" }]);

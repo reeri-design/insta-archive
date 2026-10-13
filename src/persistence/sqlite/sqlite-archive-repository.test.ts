@@ -228,6 +228,12 @@ describe("archive items", () => {
       }
     });
 
+    test("listArchiveItemIds with MAIN_ARCHIVE_SOURCES lists each in-scope item once, drops liked-only", async () => {
+      await repo.addSourceRecords([makeSource("savedOnly:messages", item("savedOnly"), { source: "messages" })]);
+      assert.deepEqual(await repo.listArchiveItemIds(OWNER, { sources: MAIN_ARCHIVE_SOURCES }), IN_SCOPE);
+      assert.deepEqual(await repo.listArchiveItemIds(OWNER), [...IN_SCOPE, item("likedOnly")].sort());
+    });
+
     test("AI enrichment candidates with MAIN_ARCHIVE_SOURCES exclude liked-only items", async () => {
       const candidates = await repo.listAiEnrichmentCandidates(OWNER, { sources: MAIN_ARCHIVE_SOURCES });
       assert.deepEqual(sorted(candidates.map((c) => c.itemId)), IN_SCOPE);

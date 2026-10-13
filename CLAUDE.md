@@ -35,6 +35,7 @@ import/capture → AI first-pass organization → human review/edit → archive/
 - **Media storage:** local filesystem (`MEDIA_STORAGE_DIR`) to start, behind the `MediaStorage` interface. Binaries never go in SQLite. Retrieval sources implement `MediaSourceAdapter`; see `docs/media-retrieval.md`.
 - **AI providers must be replaceable.** All AI calls go through a provider abstraction. Claude is the first provider, but application code must not import a vendor SDK directly or depend on vendor-specific types outside the provider implementation.
 - Keep ingestion, organization (AI), review and search as separate concerns.
+- UI/design direction: `docs/design-direction.md`
 - Prefer few dependencies. Do not add component libraries or other libraries without a clear need.
 
 ## Working agreements

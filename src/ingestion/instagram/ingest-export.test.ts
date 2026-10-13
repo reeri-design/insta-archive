@@ -225,6 +225,7 @@ function bind(target: SqliteArchiveRepository): ArchiveRepository {
     getArchiveItemAggregate: (id) => target.getArchiveItemAggregate(id),
     findArchiveItemByIdentity: (o, i) => target.findArchiveItemByIdentity(o, i),
     listArchiveItems: (o, p) => target.listArchiveItems(o, p),
+    listArchiveItemIds: (o, p) => target.listArchiveItemIds(o, p),
     enqueueMediaRetrieval: (r) => target.enqueueMediaRetrieval(r),
     saveMediaRetrievalRequest: (r) => target.saveMediaRetrievalRequest(r),
     getMediaRetrievalRequest: (id) => target.getMediaRetrievalRequest(id),

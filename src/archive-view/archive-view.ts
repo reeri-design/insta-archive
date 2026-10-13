@@ -18,10 +18,12 @@ import type {
 } from "../domain/archive-item.ts";
 import { reviewStatusOf } from "../domain/archive-item.ts";
 import { isInMainArchive, MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
+import type { MediaRetrievalRequest } from "../domain/media-retrieval.ts";
 import type { MediaStorage } from "../media/media-storage.ts";
 import type { ArchiveRepository } from "../persistence/archive-repository.ts";
 import type { SearchField } from "../search/search-query.ts";
 import { buildCuratedOrganization, parseReviewInput, type ReviewInput } from "./review.ts";
+import { randomSeed, shuffleSelection } from "./shuffle.ts";
 
 // ---------------------------------------------------------------------------
 // Routes
@@ -56,9 +58,38 @@ export function mediaHref(item: ArchiveItem, asset: MediaAsset): string {
 // Browse
 // ---------------------------------------------------------------------------
 
-export type MediaPreview = { mediaType: "image" | "video"; url: string };
+export type MediaPreview = {
+  mediaType: "image" | "video";
+  url: string;
+  /** Stored pixel size, when recorded; lets the library keep the natural aspect ratio. */
+  width?: number;
+  height?: number;
+  /** The post's cover image (a Reel whose video could not be retrieved). */
+  cover?: boolean;
+};
+
+/**
+ * What the library can say about an item's media: shown, not retrieved yet,
+ * retrieval failed (will be retried), or not obtainable. Derived from the
+ * item's assets and retrieval request; nothing new is stored.
+ */
+export type MediaState = "available" | "pending" | "failed" | "unavailable";
+
+/**
+ * Media Focus can show, in order: the stored post media (slides, image or
+ * video); else frames kept from a Reel's video; else the post's cover image.
+ */
+export type ViewableMedia = {
+  mediaType: "image" | "video";
+  url: string;
+  width?: number;
+  height?: number;
+  role: "content" | "frame" | "cover";
+};
 
 export type ArchiveCard = {
+  /** The item's URL key (see itemKey). */
+  key: string;
   href: string;
   kind: ArchiveItem["kind"];
   creator?: Creator;
@@ -74,6 +105,10 @@ export type ArchiveCard = {
   organization?: { type?: string; category?: string };
   /** For search results: the fields the query matched. */
   matchedFields?: SearchField[];
+  mediaState: MediaState;
+  viewable: ViewableMedia[];
+  /** The original post on its source (e.g. its Instagram URL). */
+  sourceUrl: string;
 };
 
 export const DEFAULT_PAGE_SIZE = 60;
@@ -95,7 +130,7 @@ export async function listArchiveCards(
   const cards: ArchiveCard[] = [];
   for (const item of items.slice(0, pageSize)) {
     const aggregate = await repository.getArchiveItemAggregate(item.id);
-    if (aggregate) cards.push(toCard(aggregate));
+    if (aggregate) cards.push(toCard(aggregate, await repository.getMediaRetrievalRequest(item.id)));
   }
   return { cards, page, hasNext: items.length > pageSize };
 }
@@ -120,12 +155,44 @@ export async function searchArchiveCards(
   const cards: ArchiveCard[] = [];
   for (const hit of hits) {
     const aggregate = await repository.getArchiveItemAggregate(hit.item.id);
-    if (aggregate) cards.push({ ...toCard(aggregate), matchedFields: hit.matchedFields });
+    if (aggregate) {
+      const request = await repository.getMediaRetrievalRequest(hit.item.id);
+      cards.push({ ...toCard(aggregate, request), matchedFields: hit.matchedFields });
+    }
   }
   return { cards, page, hasNext: page * pageSize < total, total };
 }
 
-function toCard(aggregate: ArchiveItemAggregate): ArchiveCard {
+/**
+ * A Shuffle selection of the main archive (see shuffle.ts), in its shuffled
+ * order: a fresh one per call unless `seed` is given. Only the ids of the
+ * whole archive are read; cards are built for the chosen items alone.
+ */
+export async function listShuffledArchiveCards(
+  repository: ArchiveRepository,
+  ownerId: UserId,
+  options: { seed?: string; size?: number } = {},
+): Promise<ArchiveCard[]> {
+  const ids = await repository.listArchiveItemIds(ownerId, { sources: MAIN_ARCHIVE_SOURCES });
+  const cards: ArchiveCard[] = [];
+  for (const id of shuffleSelection(ids, options.seed ?? randomSeed(), options.size)) {
+    const aggregate = await repository.getArchiveItemAggregate(id);
+    if (aggregate) cards.push(toCard(aggregate, await repository.getMediaRetrievalRequest(id)));
+  }
+  return cards;
+}
+
+/** One main-archive item as a card, by its URL key (e.g. to focus an item that is not on the current page). */
+export async function getArchiveCard(
+  repository: ArchiveRepository,
+  ownerId: UserId,
+  key: string,
+): Promise<ArchiveCard | undefined> {
+  const aggregate = await findAggregate(repository, ownerId, key);
+  return aggregate && toCard(aggregate, await repository.getMediaRetrievalRequest(aggregate.item.id));
+}
+
+function toCard(aggregate: ArchiveItemAggregate, request: MediaRetrievalRequest | undefined): ArchiveCard {
   const { item } = aggregate;
   const latestAt = aggregate.sources
     .map((s) => s.occurredAt)
@@ -135,6 +202,7 @@ function toCard(aggregate: ArchiveItemAggregate): ArchiveCard {
   const preview = previewOf(aggregate);
   const fields = aggregate.curated?.fields ?? latestSuggestion(aggregate)?.fields;
   return {
+    key: itemKey(item.identity),
     href: itemHref(item),
     kind: item.kind,
     ...(item.original.creator && { creator: item.original.creator.value }),
@@ -144,6 +212,9 @@ function toCard(aggregate: ArchiveItemAggregate): ArchiveCard {
     ...(preview && { preview }),
     storedMediaCount: storedContent(aggregate).length,
     reviewStatus: reviewStatusOf(aggregate),
+    mediaState: mediaStateOf(preview, request),
+    viewable: viewableOf(aggregate),
+    sourceUrl: item.canonicalUrl,
     ...(fields && {
       organization: { ...(fields.type && { type: fields.type }), ...(fields.category && { category: fields.category }) },
     }),
@@ -154,9 +225,50 @@ function toCard(aggregate: ArchiveItemAggregate): ArchiveCard {
 function previewOf(aggregate: ArchiveItemAggregate): MediaPreview | undefined {
   const content = storedContent(aggregate);
   const image = content.find((m) => m.mediaType === "image") ?? storedFrames(aggregate)[0] ?? storedCover(aggregate);
-  if (image) return { mediaType: "image", url: mediaHref(aggregate.item, image) };
-  const video = content.find((m) => m.mediaType === "video");
-  return video && { mediaType: "video", url: mediaHref(aggregate.item, video) };
+  const asset = image ?? content.find((m) => m.mediaType === "video");
+  if (!asset || asset.retrieval.status !== "stored") return undefined;
+  const { width, height } = asset.retrieval;
+  return {
+    mediaType: image ? "image" : "video",
+    url: mediaHref(aggregate.item, asset),
+    ...(width !== undefined && height !== undefined && { width, height }),
+    ...(asset.role === "cover" && { cover: true }),
+  };
+}
+
+function viewableOf(aggregate: ArchiveItemAggregate): ViewableMedia[] {
+  const content = storedContent(aggregate);
+  const frames = storedFrames(aggregate);
+  const cover = storedCover(aggregate);
+  const chosen: { asset: MediaAsset; role: ViewableMedia["role"] }[] =
+    content.length > 0
+      ? content.map((asset) => ({ asset, role: "content" }))
+      : frames.length > 0
+        ? frames.map((asset) => ({ asset, role: "frame" }))
+        : cover
+          ? [{ asset: cover, role: "cover" }]
+          : [];
+  return chosen.flatMap(({ asset, role }) => {
+    if (asset.retrieval.status !== "stored") return [];
+    const { width, height } = asset.retrieval;
+    return [
+      {
+        mediaType: asset.mediaType,
+        url: mediaHref(aggregate.item, asset),
+        ...(width !== undefined && height !== undefined && { width, height }),
+        role,
+      },
+    ];
+  });
+}
+
+/** Shown if there is a preview; otherwise what the retrieval request says (no request yet counts as pending). */
+function mediaStateOf(preview: MediaPreview | undefined, request: MediaRetrievalRequest | undefined): MediaState {
+  if (preview) return "available";
+  if (!request || request.status === "pending") return "pending";
+  if (request.status === "failed") return "failed";
+  // "unavailable", or "stored" with nothing previewable (e.g. only unsupported video slides).
+  return "unavailable";
 }
 
 // ---------------------------------------------------------------------------

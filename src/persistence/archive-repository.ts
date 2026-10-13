@@ -150,6 +150,13 @@ export interface ArchiveRepository {
     ownerId: UserId,
     page?: { limit?: number; offset?: number; order?: "created" | "recent"; sources?: readonly SourceKind[] },
   ): Promise<ArchiveItem[]>;
+
+  /**
+   * The ids of all of an owner's items, by id: cheap enough to choose among
+   * the whole archive (e.g. Shuffle) without loading the items themselves.
+   * With `sources`, only items with at least one source record of those kinds.
+   */
+  listArchiveItemIds(ownerId: UserId, options?: { sources?: readonly SourceKind[] }): Promise<ArchiveItemId[]>;
 }
 
 export type ArchiveSearchHit = {

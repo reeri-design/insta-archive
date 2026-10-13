@@ -1,106 +1,38 @@
-import Image from "next/image";
-import Link from "next/link";
-import { listArchiveCards, searchArchiveCards, type ArchiveCard } from "../archive-view/archive-view.ts";
+import { redirect } from "next/navigation";
+import { getArchiveCard, listArchiveCards } from "../archive-view/archive-view.ts";
+import { FOCUS_PARAM } from "../library/focus-param.ts";
+import { libraryItemOf } from "../library/library-item.ts";
+import { QUERY_PARAM, searchHref } from "../library/search-url.ts";
 import { archiveRepository, OWNER_ID } from "./archive-server.ts";
-import { formatDate } from "./format.ts";
+import { LibraryBrowse } from "./library-browse.tsx";
+
+/**
+ * The whole main archive goes onto the canvas at once; the canvas repeats it
+ * to fill an unbounded field and only puts what is near the view in the DOM.
+ * A safety cap, far above today's archive.
+ */
+const CANVAS_ITEM_LIMIT = 20_000;
 
 const first = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value);
 
-export default async function ArchivePage({ searchParams }: PageProps<"/">) {
+/** Browse (docs/design-direction.md §3, level 1): the canvas, to wander. Search (in the top nav, site-nav.tsx) is its own page. */
+export default async function LibraryPage({ searchParams }: PageProps<"/">) {
   const params = await searchParams;
-  const query = (first(params.q) ?? "").trim();
-  const requested = Number(first(params.page));
-  const pageNumber = Number.isSafeInteger(requested) && requested > 0 ? requested : 1;
-  const search = query ? await searchArchiveCards(archiveRepository(), OWNER_ID, query, { page: pageNumber }) : undefined;
-  const { cards, page, hasNext } = search ?? (await listArchiveCards(archiveRepository(), OWNER_ID, { page: pageNumber }));
-  const pageHref = (n: number) => `/?${new URLSearchParams({ ...(query && { q: query }), page: String(n) })}`;
+  // Searching used to happen on the canvas; old links go to the Search page.
+  const query = (first(params[QUERY_PARAM]) ?? "").trim();
+  if (query) redirect(searchHref(query));
+
+  // Shuffle (from the nav) swaps in its own selection on the client, in place (library-browse.tsx).
+  const { cards } = await listArchiveCards(archiveRepository(), OWNER_ID, { pageSize: CANVAS_ITEM_LIMIT });
+  // A deep link may focus an item that is not among these.
+  const focusKey = first(params[FOCUS_PARAM]);
+  const extra =
+    focusKey && !cards.some((c) => c.key === focusKey) ? await getArchiveCard(archiveRepository(), OWNER_ID, focusKey) : undefined;
+  const items = [...cards, ...(extra ? [extra] : [])].map(libraryItemOf);
 
   return (
-    <main className="archive">
-      <form action="/" className="search">
-        <input
-          type="search"
-          name="q"
-          defaultValue={query}
-          placeholder="Search your archive: creators, captions, tags, ideas…"
-          aria-label="Search the archive"
-          autoFocus={!query}
-        />
-        <button type="submit">Search</button>
-      </form>
-      <p className="muted">
-        {search ? (
-          <>
-            {search.total} {search.total === 1 ? "result" : "results"} for “{query}” · best matches first
-            {search.total > 0 && ` · page ${page}`} · <Link href="/">Clear</Link>
-          </>
-        ) : (
-          <>Most recently saved or shared first · page {page}</>
-        )}
-      </p>
-      {cards.length === 0 ? (
-        <p className="empty">{query ? "Nothing in your archive matches that." : "No items on this page."}</p>
-      ) : (
-        <ul className="grid">
-          {cards.map((card) => (
-            <li key={card.href}>
-              <Card card={card} />
-            </li>
-          ))}
-        </ul>
-      )}
-      <nav className="pager">
-        {page > 1 ? <Link href={pageHref(page - 1)}>{query ? "← Previous" : "← Newer"}</Link> : <span />}
-        {hasNext && <Link href={pageHref(page + 1)}>{query ? "Next →" : "Older →"}</Link>}
-      </nav>
+    <main className="library">
+      {items.length === 0 ? <p className="library-empty">Nothing in your archive yet.</p> : <LibraryBrowse items={items} />}
     </main>
   );
 }
-
-function Card({ card }: { card: ArchiveCard }) {
-  const creator = card.creator?.username ? `@${card.creator.username}` : card.creator?.displayName;
-  return (
-    <Link href={card.href} className="card">
-      <div className="thumb">
-        {card.preview?.mediaType === "image" && (
-          <Image src={card.preview.url} alt="" fill sizes="220px" unoptimized />
-        )}
-        {card.preview?.mediaType === "video" && (
-          // A muted, unplayed video shows its first frame as a thumbnail.
-          <video src={`${card.preview.url}#t=0.1`} muted playsInline preload="metadata" />
-        )}
-        {!card.preview && <p className="thumb-text">{card.caption ?? "No caption"}</p>}
-        <span className="badge kind">
-          {card.kind}
-          {card.storedMediaCount > 1 && ` · ${card.storedMediaCount}`}
-        </span>
-        {card.reviewStatus !== "unorganized" && (
-          <span className={`badge status ${card.reviewStatus}`}>{card.reviewStatus === "reviewed" ? "Reviewed" : "AI"}</span>
-        )}
-      </div>
-      <div className="card-meta">
-        <span className="creator">{creator ?? "Unknown creator"}</span>
-        <span className="muted">
-          {card.sources.join(" · ")}
-          {card.latestAt && ` · ${formatDate(card.latestAt)}`}
-        </span>
-        {card.organization && (
-          <span className="muted">{[card.organization.type, card.organization.category].filter(Boolean).join(" / ")}</span>
-        )}
-        {card.matchedFields && card.matchedFields.length > 0 && (
-          <span className="matched">matched: {card.matchedFields.map((f) => FIELD_LABELS[f]).join(", ")}</span>
-        )}
-      </div>
-    </Link>
-  );
-}
-
-const FIELD_LABELS: Record<NonNullable<ArchiveCard["matchedFields"]>[number], string> = {
-  tags: "tags",
-  creator: "creator",
-  type: "type",
-  category: "category",
-  summary: "summary",
-  usefulFor: "useful for",
-  caption: "caption",
-};
