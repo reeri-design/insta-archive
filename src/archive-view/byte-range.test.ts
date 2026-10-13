@@ -17,3 +17,13 @@ test("byte ranges: explicit, open-ended, suffix, clamped, unsatisfiable and igno
   assert.equal(parseByteRange("items=0-1", 1000), undefined);
   assert.equal(parseByteRange("bytes=-", 1000), undefined);
 });
+
+test("byte ranges: open-ended ranges can be capped to a chunk; explicit and suffix ranges are not", () => {
+  const cap = { maxOpenEndedBytes: 100 };
+  assert.deepEqual(parseByteRange("bytes=0-", 1000, cap), { start: 0, end: 99 }); // a video preview's first request
+  assert.deepEqual(parseByteRange("bytes=950-", 1000, cap), { start: 950, end: 999 }); // near the end: what's left
+  assert.deepEqual(parseByteRange("bytes=0-499", 1000, cap), { start: 0, end: 499 }); // explicit: as asked
+  assert.deepEqual(parseByteRange("bytes=-300", 1000, cap), { start: 700, end: 999 }); // suffix: as asked
+  assert.equal(parseByteRange("bytes=1000-", 1000, cap), "unsatisfiable");
+  assert.equal(parseByteRange(null, 1000, cap), undefined); // no Range header: the whole body
+});

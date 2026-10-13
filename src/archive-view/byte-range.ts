@@ -6,10 +6,16 @@
  *
  * Returns the inclusive byte range to send, "unsatisfiable" for a range
  * outside the body, or undefined to send the whole body.
+ *
+ * With `maxOpenEndedBytes`, an open-ended range ("bytes=start-") is answered
+ * with at most that many bytes, as video servers commonly do: the browser asks
+ * for the next part when playback needs it. Without it, a page of video
+ * previews that only want a first frame would each pull the whole file.
  */
 export function parseByteRange(
   header: string | null,
   size: number,
+  options: { maxOpenEndedBytes?: number } = {},
 ): { start: number; end: number } | "unsatisfiable" | undefined {
   const match = header?.trim().match(/^bytes=(\d*)-(\d*)$/);
   if (!match) return undefined;
@@ -22,7 +28,9 @@ export function parseByteRange(
     return { start: Math.max(0, size - length), end: size - 1 };
   }
   const start = Number(from);
-  const end = to === "" ? size - 1 : Math.min(Number(to), size - 1);
+  const cap = options.maxOpenEndedBytes;
+  const end =
+    to === "" ? (cap && cap > 0 ? Math.min(size - 1, start + cap - 1) : size - 1) : Math.min(Number(to), size - 1);
   if (start >= size || end < start) return "unsatisfiable";
   return { start, end };
 }

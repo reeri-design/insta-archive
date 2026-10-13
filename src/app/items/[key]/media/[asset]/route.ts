@@ -2,6 +2,14 @@ import { parseByteRange } from "../../../../../archive-view/byte-range.ts";
 import { readItemMedia } from "../../../../../archive-view/archive-view.ts";
 import { archiveRepository, mediaStorage, OWNER_ID } from "../../../../archive-server.ts";
 
+/**
+ * Open-ended range requests ("bytes=0-", which browsers send for video) get at
+ * most this much per response; the browser asks for more as playback needs it.
+ * Sending whole files let a canvas of video previews occupy every connection
+ * (Firefox), stalling navigation.
+ */
+const MAX_OPEN_ENDED_RANGE_BYTES = 1024 * 1024;
+
 /** Serves one stored media asset of an item, with byte ranges for video. */
 export async function GET(request: Request, { params }: RouteContext<"/items/[key]/media/[asset]">) {
   const { key, asset } = await params;
@@ -15,7 +23,7 @@ export async function GET(request: Request, { params }: RouteContext<"/items/[ke
     // Stored originals are never overwritten.
     "Cache-Control": "private, max-age=31536000, immutable",
   };
-  const range = parseByteRange(request.headers.get("range"), size);
+  const range = parseByteRange(request.headers.get("range"), size, { maxOpenEndedBytes: MAX_OPEN_ENDED_RANGE_BYTES });
   if (range === "unsatisfiable") {
     return new Response(null, { status: 416, headers: { ...headers, "Content-Range": `bytes */${size}` } });
   }
