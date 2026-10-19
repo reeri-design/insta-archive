@@ -22,6 +22,7 @@ import type { ArchiveRepository } from "../persistence/archive-repository.ts";
 import {
   AiProviderError,
   type AiImageInput,
+  type AiProviderErrorDetails,
   type AiProviderErrorKind,
   type OrganizationProvider,
 } from "./organization-provider.ts";
@@ -58,7 +59,16 @@ export type EnrichmentResult =
       usage?: { inputTokens: number; outputTokens: number };
     }
   | { status: "skipped"; itemId: ArchiveItemId; reason: string }
-  | { status: "failed"; itemId: ArchiveItemId; kind: AiProviderErrorKind | "invalid_output"; reason: string };
+  | {
+      status: "failed";
+      itemId: ArchiveItemId;
+      kind: AiProviderErrorKind | "invalid_output";
+      reason: string;
+      /** What the provider told about the failure (HTTP status, upstream provider, network), when it could. */
+      details?: AiProviderErrorDetails;
+      /** The provider that was called. */
+      provider?: string;
+    };
 
 export type AiEnrichmentServiceOptions = {
   repository: ArchiveRepository;
@@ -83,7 +93,14 @@ export class AiEnrichmentService {
     return IMAGE_TYPES.has(mimeType) && (!supported || (supported as readonly string[]).includes(mimeType));
   }
 
-  async enrich(itemId: ArchiveItemId): Promise<EnrichmentResult> {
+  /**
+   * With `workerId` (concurrent workers, see enrichment-batch.ts), the result
+   * is saved only while that worker still holds the item's enrichment claim;
+   * a claim lost to another worker saves nothing and reports "skipped".
+   * With `requireMedia`, an item with no media the AI can use is skipped
+   * instead of being sent metadata-only.
+   */
+  async enrich(itemId: ArchiveItemId, options: { workerId?: string; requireMedia?: boolean } = {}): Promise<EnrichmentResult> {
     const { repository, provider } = this.options;
     const aggregate = await repository.getArchiveItemAggregate(itemId);
     if (!aggregate) throw new Error(`Unknown archive item ${itemId}`);
@@ -91,6 +108,10 @@ export class AiEnrichmentService {
     if (!need.eligible) return { status: "skipped", itemId, reason: need.reason };
 
     const { images, summary } = await this.collectImages(aggregate);
+    if (options.requireMedia && images.length === 0) {
+      // Checked here, not only at selection: stored media can still yield no usable image.
+      return { status: "skipped", itemId, reason: "no media usable by the AI (media required); not sent metadata-only" };
+    }
     if (need.reason === "media_added" && images.length === 0) {
       // Redoing it from metadata alone would only repeat the existing organization.
       return { status: "skipped", itemId, reason: "media stored since the last organization is not usable by the AI" };
@@ -109,7 +130,10 @@ export class AiEnrichmentService {
       });
     } catch (error) {
       const kind = error instanceof AiProviderError ? error.kind : "provider_error";
-      return { status: "failed", itemId, kind, reason: error instanceof Error ? error.message : String(error) };
+      return {
+        status: "failed", itemId, kind, reason: error instanceof Error ? error.message : String(error), provider: provider.provider,
+        ...(error instanceof AiProviderError && Object.keys(error.details).length > 0 && { details: error.details }),
+      };
     }
 
     const validated = validateOrganizationOutput(response.output);
@@ -130,7 +154,11 @@ export class AiEnrichmentService {
       createdAt,
     };
     // Appended, never replacing the earlier one; the newest is the effective AI organization.
-    await repository.appendAiOrganization(organization);
+    if (options.workerId === undefined) {
+      await repository.appendAiOrganization(organization);
+    } else if (!(await repository.appendAiOrganizationIfClaimed(organization, options.workerId))) {
+      return { status: "skipped", itemId, reason: "the enrichment claim was taken over by another worker; nothing saved" };
+    }
     return {
       status: "enriched",
       itemId,

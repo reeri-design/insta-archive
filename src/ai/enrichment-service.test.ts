@@ -13,7 +13,7 @@ import { LocalMediaStorage } from "../media/local-media-storage.ts";
 import { storageKeyFor } from "../media/media-storage.ts";
 import { openDatabase } from "../persistence/sqlite/database.ts";
 import { SqliteArchiveRepository } from "../persistence/sqlite/sqlite-archive-repository.ts";
-import { prioritizedSample, representativeSample, runEnrichmentBatch } from "./enrichment-batch.ts";
+import { prioritizedSample, representativeSample, runEnrichmentBatch, selectItemsForEnrichment } from "./enrichment-batch.ts";
 import { isEnrichmentCandidate } from "./enrichment-eligibility.ts";
 import { AiEnrichmentService } from "./enrichment-service.ts";
 import { ORGANIZATION_INSTRUCTIONS } from "./organization-prompt.ts";
@@ -607,6 +607,30 @@ describe("runEnrichmentBatch", () => {
     assert.equal(summary.stoppedForAuthentication, true);
     assert.equal(summary.failed, 1);
     assert.equal(provider.requests.length, 1);
+  });
+
+  test("requireMedia: only items with stored media are chosen, even when the limit leaves room for caption-only ones", async () => {
+    await storeAsset({ id: `${id("CarouBBB222")}:media:0` as MediaAssetId, archiveItemId: id("CarouBBB222"), mediaType: "image", role: "content", position: 0 }, "image/jpeg", new Uint8Array([1]));
+    // With claims, as the CLI runs it: selection takes every candidate, so the filter must hold there too.
+    const summary = await batch({ limit: 5, requireMedia: true, claims: { workerId: "w1", leaseMs: 60_000 } });
+    assert.deepEqual(summary.results.map((r) => [r.itemId, r.status, r.status === "enriched" && r.mediaUsed]), [[id("CarouBBB222"), "enriched", true]]);
+    assert.equal(provider.requests.length, 1);
+    // ReelAAA111 has a caption but no media: still a candidate for a normal run.
+    assert.deepEqual(await selectItemsForEnrichment({ repository: repo, ownerId: OWNER, limit: 5, requireMedia: true }), []);
+    assert.deepEqual(await selectItemsForEnrichment({ repository: repo, ownerId: OWNER, limit: 5 }), [id("ReelAAA111")]);
+  });
+
+  test("requireMedia: stored media the AI cannot use is skipped, never sent metadata-only", async () => {
+    // Stored, but the file is gone: the default path would fall back to a metadata-only request.
+    await repo.saveMediaAssets([{
+      id: `${id("ReelAAA111")}:cover` as MediaAssetId, archiveItemId: id("ReelAAA111"), mediaType: "image", role: "cover",
+      retrieval: { status: "stored", storageKey: "aa/missing/cover.jpg", mimeType: "image/jpeg", retrievedAt: T0 },
+    }]);
+    const summary = await batch({ limit: 5, requireMedia: true });
+    assert.deepEqual(summary.results.map((r) => [r.itemId, r.status]), [[id("ReelAAA111"), "skipped"]]);
+    assert.equal(provider.requests.length, 0);
+    assert.deepEqual((await repo.getArchiveItemAggregate(id("ReelAAA111")))?.aiSuggestions, []);
+    assert.equal(await repo.getAiEnrichmentFailure(id("ReelAAA111")), undefined);
   });
 
   test("a rate limit stops the batch", async () => {

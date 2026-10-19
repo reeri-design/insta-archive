@@ -49,11 +49,23 @@ export type AiProviderErrorKind =
   | "authentication"
   | "provider_error";
 
+/** What a provider could tell about a failure, for classifying it (see enrichment-failure.ts). */
+export type AiProviderErrorDetails = {
+  /** HTTP status of the failed call (or of the upstream error a gateway passed on). */
+  status?: number;
+  /** The upstream provider that answered, when a gateway names it (e.g. OpenRouter's "AtlasCloud"). */
+  upstreamProvider?: string;
+  /** The request never got an HTTP answer (connection reset, DNS, timeout). */
+  network?: boolean;
+};
+
 export class AiProviderError extends Error {
   override name = "AiProviderError";
   readonly kind: AiProviderErrorKind;
-  constructor(kind: AiProviderErrorKind, message: string) {
+  readonly details: AiProviderErrorDetails;
+  constructor(kind: AiProviderErrorKind, message: string, details: AiProviderErrorDetails = {}) {
     super(message);
     this.kind = kind;
+    this.details = details;
   }
 }

@@ -9,6 +9,7 @@ import type {
   Attributed,
   CuratedOrganization,
   InstagramIdentity,
+  IsoDateTime,
   MediaAsset,
   MediaAssetId,
   MediaRetrieval,
@@ -21,6 +22,7 @@ import type {
   UserId,
 } from "../../domain/archive-item.ts";
 import type { MediaRetrievalRequest } from "../../domain/media-retrieval.ts";
+import type { EnrichmentFailure } from "../../ai/enrichment-failure.ts";
 import {
   NON_CORROBORATING_FIELDS,
   CAPTIONED_TAG_PHRASE_WEIGHT,
@@ -269,6 +271,91 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async appendAiOrganization(s: AiOrganization): Promise<void> {
+    this.insertAiOrganization(s);
+  }
+
+  async appendAiOrganizationIfClaimed(s: AiOrganization, workerId: string): Promise<boolean> {
+    const holder = this.db.prepare("SELECT worker_id FROM ai_enrichment_claims WHERE archive_item_id = ?");
+    return this.transaction(() => {
+      const row = holder.get(s.archiveItemId) as { worker_id: string } | undefined;
+      if (row?.worker_id !== workerId) return false;
+      this.insertAiOrganization(s);
+      return true;
+    });
+  }
+
+  async claimAiEnrichment(itemId: ArchiveItemId, claim: { workerId: string; now: IsoDateTime; expiresAt: IsoDateTime }): Promise<boolean> {
+    if (!(claim.expiresAt > claim.now)) throw new Error("A claim must expire after it is made");
+    // One statement, so it is atomic: insert, or take over an expired claim (or renew one's own).
+    const { changes } = this.db
+      .prepare(
+        `INSERT INTO ai_enrichment_claims (archive_item_id, worker_id, claimed_at, expires_at)
+         VALUES (:item, :worker, :now, :expires)
+         ON CONFLICT (archive_item_id) DO UPDATE SET
+           worker_id = excluded.worker_id, claimed_at = excluded.claimed_at, expires_at = excluded.expires_at
+         WHERE ai_enrichment_claims.expires_at <= excluded.claimed_at
+            OR ai_enrichment_claims.worker_id = excluded.worker_id`,
+      )
+      .run({ item: itemId, worker: claim.workerId, now: claim.now, expires: claim.expiresAt });
+    return changes === 1;
+  }
+
+  async releaseAiEnrichmentClaim(itemId: ArchiveItemId, workerId: string): Promise<void> {
+    this.db.prepare("DELETE FROM ai_enrichment_claims WHERE archive_item_id = ? AND worker_id = ?").run(itemId, workerId);
+  }
+
+  async recordAiEnrichmentFailure(
+    f: Omit<EnrichmentFailure, "attempts" | "nextRetryAt">,
+    options: { retryDelayMs: (attempts: number) => number },
+  ): Promise<EnrichmentFailure> {
+    const current = this.db.prepare("SELECT attempts FROM ai_enrichment_failures WHERE archive_item_id = ?");
+    const upsert = this.db.prepare(
+      `INSERT INTO ai_enrichment_failures
+         (archive_item_id, category, status_code, provider, error_code, message, failed_at, attempts, next_retry_at)
+       VALUES (:item, :category, :status, :provider, :code, :message, :at, :attempts, :retry)
+       ON CONFLICT (archive_item_id) DO UPDATE SET
+         category = excluded.category, status_code = excluded.status_code, provider = excluded.provider,
+         error_code = excluded.error_code, message = excluded.message, failed_at = excluded.failed_at,
+         attempts = excluded.attempts, next_retry_at = excluded.next_retry_at`,
+    );
+    // One transaction: the new count and the retry time it implies are written together.
+    return this.transaction(() => {
+      const previous = current.get(f.itemId) as { attempts: number } | undefined;
+      const attempts = (previous?.attempts ?? 0) + 1;
+      const nextRetryAt = f.category === "temporary"
+        ? new Date(Date.parse(f.failedAt) + options.retryDelayMs(attempts)).toISOString()
+        : undefined;
+      upsert.run({
+        item: f.itemId, category: f.category, status: f.statusCode ?? null, provider: f.provider ?? null,
+        code: f.errorCode, message: f.message, at: f.failedAt, attempts, retry: nextRetryAt ?? null,
+      });
+      return { ...f, attempts, ...(nextRetryAt !== undefined && { nextRetryAt }) };
+    });
+  }
+
+  async getAiEnrichmentFailure(itemId: ArchiveItemId): Promise<EnrichmentFailure | undefined> {
+    const row = this.db.prepare("SELECT * FROM ai_enrichment_failures WHERE archive_item_id = ?").get(itemId) as
+      | { category: EnrichmentFailure["category"]; status_code: number | null; provider: string | null; error_code: string; message: string; failed_at: string; attempts: number; next_retry_at: string | null }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      itemId,
+      category: row.category,
+      ...(row.status_code !== null && { statusCode: row.status_code }),
+      ...(row.provider !== null && { provider: row.provider }),
+      errorCode: row.error_code,
+      message: row.message,
+      failedAt: row.failed_at,
+      attempts: row.attempts,
+      ...(row.next_retry_at !== null && { nextRetryAt: row.next_retry_at }),
+    };
+  }
+
+  async clearAiEnrichmentFailure(itemId: ArchiveItemId): Promise<void> {
+    this.db.prepare("DELETE FROM ai_enrichment_failures WHERE archive_item_id = ?").run(itemId);
+  }
+
+  private insertAiOrganization(s: AiOrganization): void {
     try {
       this.db
         .prepare(
@@ -384,7 +471,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   async listAiEnrichmentCandidates(
     ownerId: UserId,
-    options: { sources?: readonly SourceKind[] } = {},
+    options: { sources?: readonly SourceKind[]; unclaimedAt?: IsoDateTime; excludeProviderRejected?: boolean; retryableAt?: IsoDateTime } = {},
   ): Promise<AiEnrichmentCandidate[]> {
     const rows = this.db
       .prepare(
@@ -410,9 +497,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              SELECT 1 FROM media_assets a WHERE a.archive_item_id = i.id AND a.retrieval_status = 'stored'
                AND json_extract(a.retrieval_json, '$.retrievedAt') > latest_org.created_at))
            ${sourceFilter("i.id", options.sources)}
+           ${options.unclaimedAt === undefined ? "" : "AND NOT EXISTS (SELECT 1 FROM ai_enrichment_claims c WHERE c.archive_item_id = i.id AND c.expires_at > :unclaimed_at)"}
+           ${options.excludeProviderRejected ? "AND NOT EXISTS (SELECT 1 FROM ai_enrichment_failures f WHERE f.archive_item_id = i.id AND f.category = 'provider_rejected')" : ""}
+           ${options.retryableAt === undefined ? "" : "AND NOT EXISTS (SELECT 1 FROM ai_enrichment_failures f WHERE f.archive_item_id = i.id AND f.category = 'temporary' AND f.next_retry_at > :retryable_at)"}
          ORDER BY latest_at DESC NULLS LAST, i.id`,
       )
-      .all({ owner_id: ownerId }) as {
+      .all({
+        owner_id: ownerId,
+        ...(options.unclaimedAt !== undefined && { unclaimed_at: options.unclaimedAt }),
+        ...(options.retryableAt !== undefined && { retryable_at: options.retryableAt }),
+      }) as {
         id: string; kind: ArchiveItemKind; sources: string | null; latest_at: string | null;
         creator: string | null; has_caption: number; has_media: number; is_new: number;
         org_prompt_version: string | null; org_created_at: string | null;

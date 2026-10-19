@@ -6,6 +6,7 @@ import type {
   ArchiveItemId,
   CuratedOrganization,
   InstagramIdentity,
+  IsoDateTime,
   MediaAsset,
   OriginalMetadata,
   SourceKind,
@@ -13,6 +14,7 @@ import type {
   UserId,
 } from "../domain/archive-item.ts";
 import type { MediaRetrievalRequest } from "../domain/media-retrieval.ts";
+import type { EnrichmentFailure } from "../ai/enrichment-failure.ts";
 
 /**
  * Storage-agnostic access to the archive. Speaks only domain types; the
@@ -57,6 +59,44 @@ export interface ArchiveRepository {
 
   /** Add a new AI suggestion. Existing suggestions can never be modified. */
   appendAiOrganization(suggestion: AiOrganization): Promise<void>;
+
+  /**
+   * appendAiOrganization, only while `workerId` still holds the item's
+   * enrichment claim (checked in the same transaction). Returns false, writing
+   * nothing, when the claim is gone or belongs to another worker: a worker
+   * whose lease expired and was taken over cannot add a duplicate.
+   */
+  appendAiOrganizationIfClaimed(suggestion: AiOrganization, workerId: string): Promise<boolean>;
+
+  /**
+   * Atomically claim an item for AI enrichment until `expiresAt`. Succeeds
+   * when the item has no claim, its claim has expired (at `now`), or
+   * `workerId` already holds it (a renewal). Never takes over another
+   * worker's active claim: of two workers claiming the same item, only one
+   * gets it. A claim says nothing about eligibility; it only prevents two
+   * workers processing the same item at once.
+   */
+  claimAiEnrichment(itemId: ArchiveItemId, claim: { workerId: string; now: IsoDateTime; expiresAt: IsoDateTime }): Promise<boolean>;
+
+  /** Release `workerId`'s claim on the item, if it still holds it (another worker's claim is left alone). */
+  releaseAiEnrichmentClaim(itemId: ArchiveItemId, workerId: string): Promise<void>;
+
+  /**
+   * Record the item's latest enrichment failure (see src/ai/enrichment-failure.ts),
+   * replacing an earlier one; `attempts` counts failures since the last success.
+   * A temporary failure also gets its retry time, failedAt + retryDelayMs(attempts),
+   * computed in the same transaction as the new count. Returns the stored record.
+   */
+  recordAiEnrichmentFailure(
+    failure: Omit<EnrichmentFailure, "attempts" | "nextRetryAt">,
+    options: { retryDelayMs: (attempts: number) => number },
+  ): Promise<EnrichmentFailure>;
+
+  /** The item's latest enrichment failure, if it has one. */
+  getAiEnrichmentFailure(itemId: ArchiveItemId): Promise<EnrichmentFailure | undefined>;
+
+  /** Forget the item's enrichment failure (after a success). */
+  clearAiEnrichmentFailure(itemId: ArchiveItemId): Promise<void>;
 
   /** Insert or replace the item's single curated organization. */
   saveCuratedOrganization(curated: CuratedOrganization): Promise<void>;
@@ -108,7 +148,12 @@ export interface ArchiveRepository {
    */
   listAiEnrichmentCandidates(
     ownerId: UserId,
-    options?: { sources?: readonly SourceKind[] },
+    /**
+     * `unclaimedAt`: leave out items another worker holds an active enrichment claim on at that time.
+     * `excludeProviderRejected`: leave out items whose latest failure is provider_rejected.
+     * `retryableAt`: leave out items whose temporary failure may not be retried yet at that time.
+     */
+    options?: { sources?: readonly SourceKind[]; unclaimedAt?: IsoDateTime; excludeProviderRejected?: boolean; retryableAt?: IsoDateTime },
   ): Promise<AiEnrichmentCandidate[]>;
 
   /**

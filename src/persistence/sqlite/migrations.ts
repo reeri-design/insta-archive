@@ -250,4 +250,46 @@ export const MIGRATIONS: readonly string[] = [
   CREATE UNIQUE INDEX media_assets_cover ON media_assets (archive_item_id) WHERE role = 'cover';
   CREATE INDEX media_assets_retrieval_status ON media_assets (retrieval_status);
   `,
+  /* 5: AI enrichment claims (leases), so concurrent workers never process the same item */ `
+  -- At most one active claim per item. A claim is a lease: it expires, so a worker that crashes
+  -- or exits never excludes an item for good; an expired claim can be taken over. Rows are
+  -- removed when a worker finishes with the item, whatever the outcome.
+  CREATE TABLE ai_enrichment_claims (
+    archive_item_id  TEXT PRIMARY KEY REFERENCES archive_items (id),
+    worker_id        TEXT NOT NULL,
+    claimed_at       TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    CHECK (expires_at > claimed_at)
+  ) STRICT;
+  CREATE INDEX ai_enrichment_claims_expiry ON ai_enrichment_claims (expires_at);
+  `,
+  /* 6: persistent AI enrichment failures, so every run and worker knows an item failed */ `
+  -- One row per item: its most recent enrichment failure (see src/ai/enrichment-failure.ts).
+  -- provider_rejected rows keep the item out of normal enrichment runs; temporary and unknown
+  -- ones are informational. A later success removes the row; nothing else is deleted.
+  CREATE TABLE ai_enrichment_failures (
+    archive_item_id  TEXT PRIMARY KEY REFERENCES archive_items (id),
+    category         TEXT NOT NULL CHECK (category IN ('provider_rejected', 'temporary', 'unknown')),
+    status_code      INTEGER,
+    provider         TEXT,
+    error_code       TEXT NOT NULL,
+    message          TEXT NOT NULL,
+    failed_at        TEXT NOT NULL,
+    attempts         INTEGER NOT NULL CHECK (attempts >= 1)
+  ) STRICT;
+  CREATE INDEX ai_enrichment_failures_category ON ai_enrichment_failures (category);
+  `,
+  /* 7: backoff for temporary enrichment failures */ `
+  -- When a temporary failure may be retried (see temporaryRetryDelayMs in src/ai/enrichment-failure.ts).
+  -- NULL for other categories. Normal runs leave a temporary failure alone until this time.
+  ALTER TABLE ai_enrichment_failures ADD COLUMN next_retry_at TEXT;
+
+  -- Temporary failures recorded before this migration: the same schedule, from their failure time
+  -- and count (1 → 1 min, 2 → 5 min, 3 → 15 min, more → 30 min).
+  UPDATE ai_enrichment_failures
+    SET next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', failed_at,
+      CASE WHEN attempts = 1 THEN '+1 minutes' WHEN attempts = 2 THEN '+5 minutes'
+           WHEN attempts = 3 THEN '+15 minutes' ELSE '+30 minutes' END)
+    WHERE category = 'temporary';
+  `,
 ];

@@ -80,7 +80,7 @@ export class OpenRouterOrganizationProvider implements OrganizationProvider {
       });
       text = await response.text();
     } catch (error) {
-      throw new AiProviderError("provider_error", error instanceof Error ? error.message : String(error));
+      throw new AiProviderError("provider_error", error instanceof Error ? error.message : String(error), { network: true });
     }
     if (!response.ok) throw httpError(response.status, text);
 
@@ -91,7 +91,7 @@ export class OpenRouterOrganizationProvider implements OrganizationProvider {
       throw new AiProviderError("provider_error", "OpenRouter returned a non-JSON response");
     }
     // Upstream failures can arrive with HTTP 200 and an error object.
-    if (data.error) throw new AiProviderError("provider_error", `Upstream error: ${excerpt(JSON.stringify(data.error))}`);
+    if (data.error) throw new AiProviderError("provider_error", `Upstream error: ${excerpt(JSON.stringify(data.error))}`, upstreamDetails(data.error));
 
     const choice = data.choices?.[0];
     if (choice?.message?.refusal) throw new AiProviderError("refusal", `Model refused: ${excerpt(choice.message.refusal)}`);
@@ -120,9 +120,29 @@ export class OpenRouterOrganizationProvider implements OrganizationProvider {
 
 function httpError(status: number, body: string): AiProviderError {
   const message = `OpenRouter HTTP ${status}: ${excerpt(body)}`;
-  if (status === 429) return new AiProviderError("rate_limited", message);
-  if (status === 401 || status === 403) return new AiProviderError("authentication", `OpenRouter rejected the API key (HTTP ${status})`);
-  return new AiProviderError("provider_error", message);
+  let upstream: string | undefined;
+  try {
+    upstream = providerName((JSON.parse(body) as { error?: unknown }).error);
+  } catch {
+    // Not JSON: no upstream provider to name.
+  }
+  const details = { status, ...(upstream && { upstreamProvider: upstream }) };
+  if (status === 429) return new AiProviderError("rate_limited", message, details);
+  if (status === 401 || status === 403) return new AiProviderError("authentication", `OpenRouter rejected the API key (HTTP ${status})`, details);
+  return new AiProviderError("provider_error", message, details);
+}
+
+/** Details of an error object OpenRouter passed on with HTTP 200: its numeric code and the upstream provider. */
+function upstreamDetails(error: unknown): { status?: number; upstreamProvider?: string } {
+  const code = (error as { code?: unknown } | null)?.code;
+  const upstream = providerName(error);
+  return { ...(typeof code === "number" && { status: code }), ...(upstream && { upstreamProvider: upstream }) };
+}
+
+/** OpenRouter names the upstream provider in error.metadata.provider_name. */
+function providerName(error: unknown): string | undefined {
+  const name = (error as { metadata?: { provider_name?: unknown } } | null)?.metadata?.provider_name;
+  return typeof name === "string" ? name : undefined;
 }
 
 /** A short excerpt of a provider message for error reports. */

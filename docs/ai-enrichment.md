@@ -79,4 +79,16 @@ npm run enrich:ai -- --limit 3 --item <shortcode> …  # specific items
 - **Preview:** `--dry-run` lists the items a run would enrich, without any AI calls.
 - **Pacing:** items are processed one at a time with a pause between them (`--delay-ms`, default 1000).
 - **Stopping:** the batch stops early on a rate limit or on missing/invalid credentials. Other failures (refusals, invalid output, provider errors) are reported and save nothing.
+- **Concurrent runs (claims):** each run claims an item atomically just before processing it (`ai_enrichment_claims`, migration 5), so several `enrich:ai` runs can work at once without processing the same item.
+  - A claim is a lease, by default 10 minutes (`AI_ENRICHMENT_LEASE_MS`). One SQL statement inserts it, takes over an expired one, or renews the run's own; it never takes over another run's active claim.
+  - A run selects only items no other run holds, and passes over any it then fails to claim.
+  - The claim is released when the run is done with the item, whatever the outcome (enriched, skipped, failed, rate limited), so it never excludes an item from future enrichment. A run that crashes leaves a claim that expires after the lease.
+  - The organization is saved only while the run still holds the claim, checked in the same transaction (`appendAiOrganizationIfClaimed`): a run whose lease expired and was taken over saves nothing, so concurrent runs cannot create duplicate organizations.
+  - Claims do not change eligibility (above): they only decide which run processes an eligible item. `--dry-run` claims nothing.
+- **Failures are recorded** (`ai_enrichment_failures`, migration 6; `src/ai/enrichment-failure.ts`): one row per item, its latest failure — category, HTTP status, provider (the upstream one OpenRouter names, e.g. AtlasCloud), error code, message, time, and how many failures in a row.
+  - `provider_rejected` — HTTP 400 from the OpenRouter path (the same input gets the same answer). Normal runs no longer choose the item, and a worker that chose it before the failure was recorded passes it over once it holds the claim. Naming it with `--item` retries it.
+  - `temporary` — HTTP 502/503/504, or no HTTP answer at all (network). Retried after a backoff stored with the failure (`next_retry_at`, migration 7): 1 minute after the first failure in a row, 5 after the second, 15 after the third, 30 after every later one. Until then normal runs do not choose the item, and a worker that chose it before the failure passes it over once it holds the claim. Nobody waits while holding a claim: the claim is released and the item simply becomes selectable again at its retry time.
+  - `unknown` — anything else (other HTTP errors, refusals, unreadable output). Stays eligible.
+  - Not recorded: a rate limit (the run stops, as before) and missing or rejected credentials.
+  - The failure is written while the item is still claimed, before the claim is released. A success clears the item's record. Nothing is marked unavailable or deleted.
 - **Output:** one line per item (media used or metadata-only, type, category, confidence), then totals including token usage.

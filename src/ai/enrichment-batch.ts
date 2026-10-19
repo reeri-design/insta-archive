@@ -1,15 +1,40 @@
 /**
  * A small, explicit enrichment batch: a fixed limit, a deterministic choice of
  * items (or the ones named), one call at a time, stopping on a rate limit.
+ *
+ * With `claims`, several batches (workers) can run at once without processing
+ * the same item: each item is claimed atomically just before it is processed
+ * (a lease, see ArchiveRepository.claimAiEnrichment), skipped if another
+ * worker holds it, and released when done — enriched, skipped or failed —
+ * so it stays subject to the usual eligibility rules. A worker that crashes
+ * leaves a claim that expires after the lease, and can then be taken over.
  */
 import type { ArchiveItemId, UserId } from "../domain/archive-item.ts";
 import { isInMainArchive, MAIN_ARCHIVE_SOURCES } from "../domain/archive-scope.ts";
 import type { AiEnrichmentCandidate, ArchiveRepository } from "../persistence/archive-repository.ts";
 import { isEnrichmentCandidate } from "./enrichment-eligibility.ts";
+import { failureRecordFor, holdsBackItem, temporaryRetryDelayMs } from "./enrichment-failure.ts";
 import type { AiEnrichmentService, EnrichmentResult } from "./enrichment-service.ts";
 
 /** Hard ceiling per run, so a batch can never cover the whole archive by accident. */
 export const MAX_ENRICHMENT_LIMIT = 100;
+
+/**
+ * Default enrichment lease: 10 minutes. One item takes well under a minute
+ * (provider timeouts included), so a live worker never loses a claim, while a
+ * crashed one blocks its item only briefly. Override with AI_ENRICHMENT_LEASE_MS.
+ */
+export const DEFAULT_AI_ENRICHMENT_LEASE_MS = 600_000;
+
+export function aiEnrichmentLeaseMsFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): number {
+  const raw = env.AI_ENRICHMENT_LEASE_MS?.trim();
+  if (!raw) return DEFAULT_AI_ENRICHMENT_LEASE_MS;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`AI_ENRICHMENT_LEASE_MS must be a positive integer (milliseconds), got "${raw}"`);
+  }
+  return value;
+}
 
 export type EnrichmentBatchSummary = {
   attempted: number;
@@ -17,6 +42,12 @@ export type EnrichmentBatchSummary = {
   skipped: number;
   failed: number;
   rateLimited: boolean;
+  /** With claims: candidates passed over because another worker held them. */
+  claimedElsewhere: number;
+  /** Candidates passed over because the provider rejected them before (a persisted provider_rejected failure). */
+  providerRejected: number;
+  /** Candidates passed over because their temporary failure's retry time has not come yet. */
+  backingOff: number;
   /** Stopped because the provider rejected or lacked credentials. */
   stoppedForAuthentication: boolean;
   inputTokens: number;
@@ -34,6 +65,12 @@ export type EnrichmentBatchOptions = {
   delayMs?: number;
   sleep?: (ms: number) => Promise<void>;
   onResult?: (result: EnrichmentResult) => void;
+  /** Claim each item before processing it, so concurrent workers never process the same one. */
+  claims?: { workerId: string; leaseMs: number; now?: () => Date };
+  /** Clock for failure timestamps (defaults to the claims clock, else the system clock). */
+  now?: () => Date;
+  /** Only items with stored media are chosen, and any without media the AI can use are skipped, never sent metadata-only. */
+  requireMedia?: boolean;
 };
 
 export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promise<EnrichmentBatchSummary> {
@@ -42,18 +79,66 @@ export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promi
     throw new Error(`limit must be an integer from 1 to ${MAX_ENRICHMENT_LIMIT}`);
   }
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const itemIds = await selectItemsForEnrichment(options);
+  const { claims } = options;
+  const clock = claims?.now ?? options.now ?? (() => new Date());
+  const named = (options.shortcodes?.length ?? 0) > 0;
+  // With claims, look past items other workers hold: take candidates in priority order until `limit` are claimed.
+  const startedAt = clock().toISOString();
+  const itemIds = claims
+    ? await selectItemsForEnrichment({ ...options, limit: Number.MAX_SAFE_INTEGER, unclaimedAt: startedAt, retryableAt: startedAt })
+    : await selectItemsForEnrichment({ ...options, retryableAt: startedAt });
 
   const summary: EnrichmentBatchSummary = {
-    attempted: 0, enriched: 0, skipped: 0, failed: 0, rateLimited: false, stoppedForAuthentication: false, inputTokens: 0, outputTokens: 0, results: [],
+    attempted: 0, enriched: 0, skipped: 0, failed: 0, rateLimited: false, claimedElsewhere: 0, providerRejected: 0, backingOff: 0, stoppedForAuthentication: false,
+    inputTokens: 0, outputTokens: 0, results: [],
   };
-  for (const [index, itemId] of itemIds.entries()) {
-    if (index > 0 && options.delayMs) await sleep(options.delayMs);
-    let result: EnrichmentResult;
+  for (const itemId of itemIds) {
+    if (summary.attempted >= limit) break;
+    if (claims) {
+      const now = clock();
+      const claimed = await options.repository.claimAiEnrichment(itemId, {
+        workerId: claims.workerId,
+        now: now.toISOString(),
+        expiresAt: new Date(now.getTime() + claims.leaseMs).toISOString(),
+      });
+      if (!claimed) {
+        summary.claimedElsewhere++;
+        continue;
+      }
+    }
+    let result: EnrichmentResult | undefined;
     try {
-      result = await options.service.enrich(itemId);
-    } catch (error) {
-      result = { status: "failed", itemId, kind: "provider_error", reason: error instanceof Error ? error.message : String(error) };
+      // The item failed since this run chose its items (possibly in another worker): normal runs leave
+      // a rejected item alone, and a temporary failure until its retry time. Naming it (shortcodes) retries it.
+      const held = named ? undefined : holdsBackItem(await options.repository.getAiEnrichmentFailure(itemId), clock().toISOString());
+      if (held === "provider_rejected") {
+        summary.providerRejected++;
+        continue;
+      }
+      if (held === "backing_off") {
+        summary.backingOff++;
+        continue;
+      }
+      if (summary.attempted > 0 && options.delayMs) await sleep(options.delayMs);
+      try {
+        result = await options.service.enrich(itemId, {
+          ...(claims && { workerId: claims.workerId }),
+          ...(options.requireMedia && { requireMedia: true }),
+        });
+      } catch (error) {
+        result = { status: "failed", itemId, kind: "provider_error", reason: error instanceof Error ? error.message : String(error) };
+      }
+      // Persist the outcome while the item is still claimed, so no other worker acts on stale state.
+      if (result.status === "enriched") {
+        await options.repository.clearAiEnrichmentFailure(itemId);
+      } else if (result.status === "failed") {
+        const record = failureRecordFor(result, clock().toISOString());
+        // A temporary failure gets its retry time here; nobody waits for it while holding the claim.
+        if (record) await options.repository.recordAiEnrichmentFailure(record, { retryDelayMs: temporaryRetryDelayMs });
+      }
+    } finally {
+      // Done with the item, whatever happened: it is subject to the usual eligibility rules again.
+      if (claims) await options.repository.releaseAiEnrichmentClaim(itemId, claims.workerId);
     }
     summary.attempted++;
     summary.results.push(result);
@@ -85,10 +170,10 @@ export async function runEnrichmentBatch(options: EnrichmentBatchOptions): Promi
  * prioritizedSample of the items needing enrichment: those without an AI
  * organization, and those organized without media that have media now. Both are
  * limited to the main archive (Saved + Messages): liked-only items are
- * never enriched.
+ * never enriched. With `requireMedia`, only items with stored media are chosen.
  */
 export async function selectItemsForEnrichment(
-  options: Pick<EnrichmentBatchOptions, "repository" | "ownerId" | "limit" | "shortcodes">,
+  options: Pick<EnrichmentBatchOptions, "repository" | "ownerId" | "limit" | "shortcodes" | "requireMedia"> & { unclaimedAt?: string; retryableAt?: string },
 ): Promise<ArchiveItemId[]> {
   const { repository, ownerId, limit } = options;
   if (options.shortcodes && options.shortcodes.length > 0) {
@@ -104,8 +189,16 @@ export async function selectItemsForEnrichment(
     }
     return ids;
   }
-  const candidates = await repository.listAiEnrichmentCandidates(ownerId, { sources: MAIN_ARCHIVE_SOURCES });
-  return prioritizedSample(candidates.filter(isEnrichmentCandidate), limit);
+  const candidates = await repository.listAiEnrichmentCandidates(ownerId, {
+    sources: MAIN_ARCHIVE_SOURCES,
+    // Items the provider rejected are not chosen again; naming them (shortcodes, above) retries them.
+    excludeProviderRejected: true,
+    // Temporary failures wait for their retry time (default: now).
+    retryableAt: options.retryableAt ?? new Date().toISOString(),
+    ...(options.unclaimedAt !== undefined && { unclaimedAt: options.unclaimedAt }),
+  });
+  const usable = candidates.filter((c) => isEnrichmentCandidate(c) && (!options.requireMedia || c.hasStoredMedia));
+  return prioritizedSample(usable, limit);
 }
 
 /**
