@@ -227,6 +227,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async saveMediaAssets(assets: MediaAsset[]): Promise<void> {
+    this.writeMediaAssets(assets);
+  }
+
+  /** saveMediaAssets, synchronously (so it can share a transaction). */
+  private writeMediaAssets(assets: MediaAsset[]): void {
     const upsert = this.db.prepare(
       `INSERT INTO media_assets
          (id, archive_item_id, role, media_type, position, derived_from_asset_id, frame_time_ms,
@@ -268,6 +273,30 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         }
       }
     });
+  }
+
+  async replaceReelFrames(itemId: ArchiveItemId, frames: MediaAsset[]): Promise<void> {
+    if (frames.some((f) => f.archiveItemId !== itemId || f.role !== "derived_frame" || f.derivedFromAssetId)) {
+      throw new PersistenceIntegrityError(`Reel frames for ${itemId} must be its own derived frames without a source video`);
+    }
+    const remove = this.db.prepare(
+      "DELETE FROM media_assets WHERE archive_item_id = ? AND role = 'derived_frame' AND derived_from_asset_id IS NULL",
+    );
+    // One transaction: the old frames go and the new ones arrive together, or neither.
+    this.transaction(() => {
+      remove.run(itemId);
+      this.writeMediaAssets(frames);
+    });
+  }
+
+  async listItemIdsWithReelFrames(ownerId: UserId): Promise<ArchiveItemId[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT m.archive_item_id AS id FROM media_assets m JOIN archive_items a ON a.id = m.archive_item_id
+         WHERE a.owner_id = ? AND m.role = 'derived_frame' AND m.derived_from_asset_id IS NULL ORDER BY m.archive_item_id`,
+      )
+      .all(ownerId) as { id: string }[];
+    return rows.map((r) => r.id as ArchiveItemId);
   }
 
   async appendAiOrganization(s: AiOrganization): Promise<void> {

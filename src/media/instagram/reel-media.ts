@@ -1,15 +1,17 @@
 /**
- * Reel media strategy (Step 08B.5; builds on spikes 08B.3–08B.4).
+ * Reel media strategy.
  *
  * A Reel's video is its canonical media. After downloading it:
- *  - byteLength <= maxRetainedVideoBytes → store the video unchanged as the
- *    Reel's `content` video asset;
- *  - otherwise → write it to a temporary file, extract frames at an interval
- *    chosen by the video's size (see FRAME_INTERVAL_BUCKETS; first and final
- *    frame included), store the frames as
- *    `derived_frame` assets without `derivedFromAssetId`, and delete the
- *    video. No video asset is kept.
- * The threshold is configurable and experimental (REEL_MAX_RETAINED_VIDEO_BYTES).
+ *  - byteLength <= maxRetainedVideoBytes (default 10 MB) → store the video
+ *    unchanged as the Reel's `content` video asset;
+ *  - otherwise → write it to a temporary file, choose up to
+ *    MAX_DERIVED_FRAMES representative frames across the whole video (scene
+ *    changes first; no near-duplicates, black frames or end cards; see
+ *    frame-selection.ts), store them as JPEG `derived_frame` assets without
+ *    `derivedFromAssetId`, store the creator's cover separately when the page
+ *    publishes one (a `cover` asset; it does not count toward the frames), and
+ *    delete the video. No video asset is kept.
+ * The threshold is configurable (REEL_MAX_RETAINED_VIDEO_BYTES).
  *
  * When the source withholds the video (no video URL) but publishes the
  * Reel's cover image, the cover is stored with the `cover` role and the
@@ -38,6 +40,7 @@ import {
 } from "../../domain/media-retrieval.ts";
 import type { ArchiveRepository } from "../../persistence/archive-repository.ts";
 import type { MediaSourceAdapter, RetrievedAsset } from "../media-source-adapter.ts";
+import { MAX_DERIVED_FRAMES } from "./frame-selection.ts";
 import { storageKeyFor, type MediaStorage } from "../media-storage.ts";
 
 // ---------------------------------------------------------------------------
@@ -45,11 +48,12 @@ import { storageKeyFor, type MediaStorage } from "../media-storage.ts";
 // ---------------------------------------------------------------------------
 
 /**
- * EXPERIMENTAL default: 20 MB. The test Reel (08B.3) was 2.17 MB for 12.4 s
- * (~1.4 Mbit/s), so this keeps the video for Reels up to roughly 2 minutes at
- * that bitrate. Override with REEL_MAX_RETAINED_VIDEO_BYTES.
+ * Default: 10 MB. In the archive's retrieved Reels (2026-10) this keeps the
+ * original video for about 72% of them — every typical short Reel — while the
+ * 10–20 MB band took ~36% of video storage at ~12× the cost of its frames and
+ * cover. Override with REEL_MAX_RETAINED_VIDEO_BYTES.
  */
-export const DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES = 20_000_000;
+export const DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES = 10_000_000;
 
 export function reelMaxRetainedVideoBytesFromEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -68,28 +72,12 @@ export function reelMaxRetainedVideoBytesFromEnv(
 // ---------------------------------------------------------------------------
 
 /**
- * EXPERIMENTAL: sampling interval on the frames-only path, by downloaded video
- * size. Frames are a visual summary, so bigger videos are sampled more
- * sparsely. Checked top to bottom; the last bucket covers every video that
- * reaches the frames path (by default, larger than 20 MB).
- */
-export const FRAME_INTERVAL_BUCKETS: readonly { overBytes: number; intervalMs: number }[] = [
-  { overBytes: 100_000_000, intervalMs: 12_000 },
-  { overBytes: 50_000_000, intervalMs: 8_000 },
-  { overBytes: 0, intervalMs: 4_000 },
-];
-
-/** Interval between sampled frames for a video of this many bytes. */
-export function frameIntervalForVideoBytes(byteLength: number): number {
-  const bucket = FRAME_INTERVAL_BUCKETS.find((b) => byteLength > b.overBytes) ?? FRAME_INTERVAL_BUCKETS.at(-1);
-  if (!bucket) throw new Error("FRAME_INTERVAL_BUCKETS is empty");
-  return bucket.intervalMs;
-}
-
-/**
- * Which decoded frames to keep, given every frame's timestamp (ms, in
- * presentation order): the first frame, then the first frame at or after
- * each `intervalMs` mark, then the final frame if it was not already picked.
+ * Interval sampling, for frames taken from a stored video in a temporary
+ * folder (AI enrichment): which decoded frames to keep, given every frame's
+ * timestamp (ms, in presentation order): the first frame, then the first
+ * frame at or after each `intervalMs` mark, then the final frame if it was
+ * not already picked. A large Reel's stored frames are chosen differently
+ * (ReelFrameExtractor).
  */
 export function selectFrameIndices(frameTimesMs: readonly number[], intervalMs: number): number[] {
   if (!(intervalMs > 0)) throw new Error(`intervalMs must be positive, got ${intervalMs}`);
@@ -116,6 +104,17 @@ export interface FrameExtractor {
   extract(videoPath: string, outDir: string, intervalMs: number): Promise<ExtractedFrame[]>;
 }
 
+/** Turns a large Reel's video into the frames stored in its place. */
+export interface ReelFrameExtractor {
+  /**
+   * Writes up to `maxFrames` representative frames of the video into
+   * `outDir` as JPEG (see frame-selection.ts: across the whole video, scene
+   * changes first, no near-duplicates, black frames or end cards), and
+   * describes them. Fewer when the video has fewer distinct, useful frames.
+   */
+  representativeFrames(videoPath: string, outDir: string, options: { maxFrames: number }): Promise<ExtractedFrame[]>;
+}
+
 export type ExtractedFrame = {
   /** Actual timestamp of the frame, from the start of the video. */
   frameTimeMs: number;
@@ -138,6 +137,8 @@ export type ReelMediaRun = {
   assets: MediaAsset[];
   /** Size of the downloaded video, when one was downloaded in this run. */
   videoByteLength?: number;
+  /** Frames path: whether the creator's cover is stored next to the frames. */
+  coverStored?: boolean;
   /** True when the Reel was already stored and nothing was fetched. */
   alreadyComplete: boolean;
 };
@@ -145,9 +146,9 @@ export type ReelMediaRun = {
 export type ReelMediaRetrievalOptions = {
   repository: ArchiveRepository;
   storage: MediaStorage;
-  /** The 08B.3 Reel adapter (or a stand-in in tests). */
+  /** The Instagram Reel adapter (or a stand-in in tests). */
   adapter: MediaSourceAdapter;
-  extractor: FrameExtractor;
+  extractor: ReelFrameExtractor;
   maxRetainedVideoBytes: number;
   /** Where a temporary video goes. Defaults to the OS temp directory. */
   tempRoot?: string;
@@ -189,7 +190,8 @@ export class ReelMediaRetrieval {
     };
 
     const coverStored = await hasStoredCover(storage, aggregate);
-    const outcome = await adapter.retrieve(item, { storedPositions: new Set(), coverStored });
+    // A video that will not be kept is replaced by frames and the cover: ask for the cover too.
+    const outcome = await adapter.retrieve(item, { storedPositions: new Set(), coverStored, coverIfVideoOverBytes: maxRetainedVideoBytes });
     if (!outcome.ok) return fail(outcome.failure);
     const download = outcome.assets[0];
     const video = download?.result;
@@ -206,6 +208,7 @@ export class ReelMediaRetrieval {
 
     let assets: MediaAsset[];
     let representation: ReelRepresentation;
+    let coverKept: boolean | undefined;
     if (byteLength <= maxRetainedVideoBytes) {
       // Canonical path: keep the video exactly as retrieved.
       const id = contentAssetId(itemId, 0);
@@ -236,6 +239,22 @@ export class ReelMediaRetrieval {
       if (!frames.ok) return fail(frames.failure);
       representation = "frames";
       assets = frames.assets;
+      // The cover goes beside the frames, when there is one. It is supplementary: a failed cover
+      // download does not undo the frames (that would mean downloading the video again), except a
+      // rate limit, which still stops the batch.
+      const cover = outcome.cover;
+      if (cover?.ok === true) {
+        const id = coverAssetId(itemId);
+        try {
+          const { storageKey } = await storage.put(storageKeyFor(itemId, id, cover.mimeType), cover.bytes);
+          assets = [coverAsset(itemId, storageKey, cover, now), ...assets];
+        } catch (error) {
+          return fail({ kind: "temporary", code: "storage_error", message: messageOf(error) });
+        }
+      } else if (cover?.ok === false && cover.failure.code === "rate_limited") {
+        return fail(cover.failure);
+      }
+      coverKept = cover?.ok === true || cover?.ok === "already_stored" || coverStored;
     }
 
     const stored = recordRetrievalSuccess(request, now);
@@ -246,7 +265,10 @@ export class ReelMediaRetrieval {
       }
       await repo.saveMediaRetrievalRequest(stored);
     });
-    return { request: stored, representation, assets, videoByteLength: byteLength, alreadyComplete: false };
+    return {
+      request: stored, representation, assets, videoByteLength: byteLength, alreadyComplete: false,
+      ...(coverKept !== undefined && { coverStored: coverKept }),
+    };
   }
 
   /**
@@ -277,20 +299,7 @@ export class ReelMediaRetrieval {
       const id = coverAssetId(itemId);
       try {
         const { storageKey } = await storage.put(storageKeyFor(itemId, id, cover.mimeType), cover.bytes);
-        assets.push({
-          id,
-          archiveItemId: itemId,
-          mediaType: "image",
-          role: "cover",
-          retrieval: {
-            status: "stored",
-            storageKey,
-            mimeType: cover.mimeType,
-            retrievedAt: now,
-            byteLength: cover.bytes.byteLength,
-            ...dimensions(cover),
-          },
-        });
+        assets.push(coverAsset(itemId, storageKey, cover, now));
       } catch (error) {
         failure = { kind: "temporary", code: "storage_error", message: messageOf(error) };
       }
@@ -323,12 +332,16 @@ export class ReelMediaRetrieval {
 
       let extracted: ExtractedFrame[];
       try {
-        extracted = await extractor.extract(videoPath, join(tempDir, "frames"), frameIntervalForVideoBytes(video.bytes.byteLength));
+        extracted = await extractor.representativeFrames(videoPath, join(tempDir, "frames"), { maxFrames: MAX_DERIVED_FRAMES });
       } catch (error) {
         return { ok: false, failure: temporary(`Frame extraction failed: ${messageOf(error)}`) };
       }
       if (extracted.length === 0) return { ok: false, failure: temporary("Frame extraction produced no frames") };
 
+      if (extracted.length > MAX_DERIVED_FRAMES) return { ok: false, failure: temporary(`Frame extraction produced ${extracted.length} frames (at most ${MAX_DERIVED_FRAMES})`) };
+      if (new Set(extracted.map((f) => f.frameTimeMs)).size !== extracted.length) {
+        return { ok: false, failure: temporary("Frame extraction produced repeated timestamps") };
+      }
       const assets: MediaAsset[] = [];
       for (const frame of [...extracted].sort((a, b) => a.frameTimeMs - b.frameTimeMs)) {
         const id = `${itemId}:frame:${frame.frameTimeMs}` as MediaAssetId;
@@ -389,6 +402,22 @@ async function allStored(storage: MediaStorage, assets: MediaAsset[]): Promise<b
     if (asset.retrieval.status !== "stored" || !(await storage.has(asset.retrieval.storageKey))) return false;
   }
   return true;
+}
+
+/** The item's single `cover` asset: the still the creator chose, stored unchanged (never a frame). */
+function coverAsset(
+  itemId: ArchiveItemId,
+  storageKey: string,
+  cover: { bytes: Uint8Array; mimeType: string; width?: number; height?: number },
+  now: IsoDateTime,
+): MediaAsset {
+  return {
+    id: coverAssetId(itemId),
+    archiveItemId: itemId,
+    mediaType: "image",
+    role: "cover",
+    retrieval: { status: "stored", storageKey, mimeType: cover.mimeType, retrievedAt: now, byteLength: cover.bytes.byteLength, ...dimensions(cover) },
+  };
 }
 
 function dimensions(video: { width?: number; height?: number; durationMs?: number }) {

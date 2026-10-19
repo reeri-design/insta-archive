@@ -24,6 +24,11 @@ export type RetrievalContext = {
   storedPositions: ReadonlySet<number>;
   /** The item's cover image is already stored; the adapter may skip it. */
   coverStored?: boolean;
+  /**
+   * Reels: a downloaded video larger than this is not kept (it becomes frames),
+   * so the adapter also retrieves the post's cover image to store beside them.
+   */
+  coverIfVideoOverBytes?: number;
 };
 
 export type RetrievalOutcome =
@@ -36,8 +41,9 @@ export type RetrievalOutcome =
       metadata?: RetrievedMetadata;
       /**
        * The post's published cover image, when the adapter retrieved it (for a
-       * Reel: only when the video itself cannot be retrieved). Never a
-       * substitute content asset: it is stored with the `cover` role.
+       * Reel: when the video itself cannot be retrieved, or when the video is
+       * larger than `coverIfVideoOverBytes`). Never a substitute content asset:
+       * it is stored with the `cover` role.
        */
       cover?: RetrievedAsset["result"];
     }

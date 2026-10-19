@@ -13,15 +13,14 @@ import { LocalMediaStorage } from "../local-media-storage.ts";
 import type { MediaSourceAdapter } from "../media-source-adapter.ts";
 import { embedUrlFor, type Fetch } from "./instagram-image-spike-adapter.ts";
 import { InstagramReelSpikeAdapter } from "./instagram-reel-spike-adapter.ts";
+import { MAX_DERIVED_FRAMES } from "./frame-selection.ts";
 import {
   DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES,
-  FRAME_INTERVAL_BUCKETS,
-  frameIntervalForVideoBytes,
   ReelMediaRetrieval,
   reelMaxRetainedVideoBytesFromEnv,
   selectFrameIndices,
   type ExtractedFrame,
-  type FrameExtractor,
+  type ReelFrameExtractor,
 } from "./reel-media.ts";
 
 // ---------------------------------------------------------------------------
@@ -34,23 +33,7 @@ const pickedTimes = (times: number[], intervalMs: number) =>
   selectFrameIndices(times, intervalMs).map((i) => Math.round(times[i] ?? NaN));
 const REAL_REEL = cfr(30, 369); // the 08B.3 Reel: 369 frames at 30 fps, 0–12,267 ms
 
-describe("frame interval buckets", () => {
-  test("each size bucket selects its interval; boundaries belong to the lower bucket", () => {
-    const cases: [number, number][] = [
-      [20_000_001, 4_000], // just over the default 20 MB retention threshold
-      [50_000_000, 4_000],
-      [50_000_001, 8_000],
-      [100_000_000, 8_000],
-      [100_000_001, 12_000],
-      [2_000_000_000, 12_000],
-      [1_000_000, 4_000], // a lower configured threshold still gets the base interval
-    ];
-    for (const [bytes, intervalMs] of cases) assert.equal(frameIntervalForVideoBytes(bytes), intervalMs, `${bytes} bytes`);
-    assert.deepEqual(FRAME_INTERVAL_BUCKETS.map((b) => [b.overBytes, b.intervalMs]), [[100_000_000, 12_000], [50_000_000, 8_000], [0, 4_000]]);
-  });
-});
-
-describe("frame sampling", () => {
+describe("interval frame sampling (AI enrichment of a stored video)", () => {
   test("the real Reel's frames at each bucket interval", () => {
     assert.deepEqual(pickedTimes(REAL_REEL, 4_000), [0, 4000, 8000, 12000, 12267]);
     assert.deepEqual(pickedTimes(REAL_REEL, 8_000), [0, 8000, 12267]);
@@ -91,6 +74,11 @@ describe("frame sampling", () => {
 });
 
 describe("threshold configuration", () => {
+  test("the default is 10 MB (the old 20 MB default is gone)", () => {
+    assert.equal(DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES, 10_000_000);
+    assert.equal(reelMaxRetainedVideoBytesFromEnv({}), 10_000_000);
+  });
+
   test("defaults when unset, reads the variable, and rejects nonsense", () => {
     assert.equal(reelMaxRetainedVideoBytesFromEnv({}), DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES);
     assert.equal(reelMaxRetainedVideoBytesFromEnv({ REEL_MAX_RETAINED_VIDEO_BYTES: "  " }), DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES);
@@ -135,28 +123,28 @@ const okRoutes = () => ({
   [VIDEO_URL]: () => new Response(VIDEO_BYTES, { headers: { "content-type": "video/mp4" } }),
 });
 
-/** Writes one small file per timestamp; can be told to fail. */
-class FakeExtractor implements FrameExtractor {
+/** Writes one small JPEG-named file per timestamp; can be told to fail. */
+class FakeExtractor implements ReelFrameExtractor {
   calls = 0;
   sawVideo?: Uint8Array;
-  sawIntervalMs?: number;
+  sawMaxFrames?: number;
   private readonly timesMs: number[];
   private readonly error: Error | undefined;
   constructor(timesMs: number[], error?: Error) {
     this.timesMs = timesMs;
     this.error = error;
   }
-  async extract(videoPath: string, outDir: string, intervalMs: number): Promise<ExtractedFrame[]> {
+  async representativeFrames(videoPath: string, outDir: string, options: { maxFrames: number }): Promise<ExtractedFrame[]> {
     this.calls++;
-    this.sawIntervalMs = intervalMs;
+    this.sawMaxFrames = options.maxFrames;
     this.sawVideo = new Uint8Array(readFileSync(videoPath));
     if (this.error) throw this.error;
     mkdirSync(outDir, { recursive: true });
     // Returned out of order on purpose; frames must be stored chronologically.
-    return [...this.timesMs].reverse().map((ms) => {
-      const path = join(outDir, `frame_${ms}.png`);
-      writeFileSync(path, `png frame ${ms}`);
-      return { frameTimeMs: ms, path, mimeType: "image/png", width: 720, height: 1280 };
+    return [...this.timesMs].reverse().map((ms, k) => {
+      const path = join(outDir, `frame_${k}_${ms}.jpg`);
+      writeFileSync(path, `jpeg frame ${ms}`);
+      return { frameTimeMs: ms, path, mimeType: "image/jpeg", width: 720, height: 1280 };
     });
   }
 }
@@ -182,7 +170,7 @@ describe("Reel media strategy", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  const strategy = (maxRetainedVideoBytes: number, fetch: Fetch, extractor: FrameExtractor) =>
+  const strategy = (maxRetainedVideoBytes: number, fetch: Fetch, extractor: ReelFrameExtractor) =>
     new ReelMediaRetrieval({
       repository: repo, storage, adapter: new InstagramReelSpikeAdapter(fetch), extractor, maxRetainedVideoBytes, tempRoot,
       now: () => "2026-10-02T12:00:00.000Z",
@@ -282,7 +270,7 @@ describe("Reel media strategy", () => {
     assert.equal(result.representation, "frames");
   });
 
-  test("a larger video is stored as frames only; the video is discarded", async () => {
+  test("a larger video is stored as up to 8 JPEG frames only; the video is discarded", async () => {
     const before = await repo.getArchiveItemAggregate(ITEM_ID);
     const extractor = new FakeExtractor([0, 2000, 4000, 4900]);
     const result = await strategy(10, stubFetch(okRoutes()), extractor).run(ITEM_ID);
@@ -290,7 +278,8 @@ describe("Reel media strategy", () => {
     assert.equal(result.representation, "frames");
     assert.equal(result.request.status, "stored");
     assert.deepEqual(extractor.sawVideo, VIDEO_BYTES); // extraction used the downloaded video
-    assert.equal(extractor.sawIntervalMs, 4_000); // base bucket
+    assert.equal(extractor.sawMaxFrames, MAX_DERIVED_FRAMES);
+    assert.equal(MAX_DERIVED_FRAMES, 8);
     const assets = await media();
     assert.deepEqual(assets.map((m) => m.role === "derived_frame" && m.frameTimeMs), [0, 2000, 4000, 4900]);
     for (const frame of assets) {
@@ -299,13 +288,13 @@ describe("Reel media strategy", () => {
       assert.equal("derivedFromAssetId" in frame, false);
       assert.ok(frame.retrieval.status === "stored");
       if (frame.retrieval.status !== "stored") continue;
-      assert.equal(frame.retrieval.mimeType, "image/png");
+      assert.equal(frame.retrieval.mimeType, "image/jpeg");
       assert.equal(frame.retrieval.byteLength, readFileSync(join(dir, "media", frame.retrieval.storageKey)).byteLength);
       assert.deepEqual(frame.retrieval.derivedFrom, { mimeType: "video/mp4", byteLength: SIZE, width: 720, height: 1280, durationMs: 4900 });
     }
     // No video asset, no video file, no temp directory left.
     assert.ok(assets.every((m) => m.mediaType !== "video"));
-    assert.ok(storedFiles().every((f) => f.endsWith(".png")));
+    assert.ok(storedFiles().every((f) => f.endsWith(".jpg")));
     assert.equal(storedFiles().length, 4);
     assert.deepEqual(readdirSync(tempRoot), []);
     // The ArchiveItem (URL, kind, sources, metadata) is unchanged.
@@ -313,21 +302,109 @@ describe("Reel media strategy", () => {
     assert.deepEqual((await repo.getArchiveItemAggregate(ITEM_ID))?.sources, before?.sources);
   });
 
-  test("the frames path passes the size bucket's interval to the extractor", async () => {
-    const big = new Uint8Array(50_000_001); // just into the 8 s bucket
-    const adapter: MediaSourceAdapter = {
-      name: "stand-in",
-      canRetrieve: () => true,
-      retrieve: async () => ({ ok: true, kind: "reel", assets: [{ position: 0, mediaType: "video", result: { ok: true, bytes: big, mimeType: "video/mp4" } }] }),
+  describe("at the default 10 MB threshold", () => {
+    const sized = (bytes: number) => {
+      const asked: { coverIfVideoOverBytes?: number }[] = [];
+      const adapter: MediaSourceAdapter = {
+        name: "stand-in",
+        canRetrieve: () => true,
+        retrieve: async (_item, context) => {
+          asked.push({ ...(context.coverIfVideoOverBytes !== undefined && { coverIfVideoOverBytes: context.coverIfVideoOverBytes }) });
+          return { ok: true, kind: "reel", assets: [{ position: 0, mediaType: "video", result: { ok: true, bytes: new Uint8Array(bytes), mimeType: "video/mp4" } }] };
+        },
+      };
+      return { adapter, asked };
     };
-    const extractor = new FakeExtractor([0, 8000]);
-    const result = await new ReelMediaRetrieval({
-      repository: repo, storage, adapter, extractor, maxRetainedVideoBytes: DEFAULT_REEL_MAX_RETAINED_VIDEO_BYTES, tempRoot,
-    }).run(ITEM_ID);
-    assert.equal(result.representation, "frames");
-    assert.equal(extractor.sawIntervalMs, 8_000);
+    const run = (adapter: MediaSourceAdapter, extractor: ReelFrameExtractor) =>
+      new ReelMediaRetrieval({ repository: repo, storage, adapter, extractor, maxRetainedVideoBytes: reelMaxRetainedVideoBytesFromEnv({}), tempRoot }).run(ITEM_ID);
+
+    test("a 10 MB Reel keeps its original video", async () => {
+      const { adapter, asked } = sized(10_000_000);
+      const extractor = new FakeExtractor([0]);
+      const result = await run(adapter, extractor);
+      assert.equal(result.representation, "video");
+      assert.equal(extractor.calls, 0);
+      assert.deepEqual(asked, [{ coverIfVideoOverBytes: 10_000_000 }]);
+    });
+
+    test("a 15 MB Reel (kept under the old 20 MB threshold) becomes frames", async () => {
+      const { adapter } = sized(15_000_000);
+      const result = await run(adapter, new FakeExtractor([0, 3000]));
+      assert.equal(result.representation, "frames");
+      assert.ok((await media()).every((m) => m.role === "derived_frame" && m.retrieval.status === "stored" && m.retrieval.mimeType === "image/jpeg"));
+    });
+  });
+
+  describe("the cover beside the frames", () => {
+    const POSTER = "https://cdn.example.test/o1/cover.jpg?oh=sig";
+    const COVER = new TextEncoder().encode("jpeg cover bytes");
+    const embedWithCover = () => {
+      const media = {
+        __typename: "GraphVideo", is_video: true, product_type: "clips", video_url: VIDEO_URL, video_duration: 4.9, dimensions: { width: 720, height: 1280 },
+        display_url: POSTER, display_resources: [{ src: POSTER, config_width: 720, config_height: 1280 }],
+      };
+      const json = JSON.stringify(JSON.stringify({ gql_data: { shortcode_media: media } }));
+      return `<div class="Embed" data-media-type="GraphVideo"></div><script>x({"contextJSON":${json}})</script>`;
+    };
+    const routes = (cover: () => Response) => ({
+      [EMBED]: () => new Response(embedWithCover(), { headers: { "content-type": "text/html" } }),
+      [VIDEO_URL]: () => new Response(VIDEO_BYTES, { headers: { "content-type": "video/mp4" } }),
+      [POSTER]: cover,
+    });
+    const jpeg = () => new Response(COVER, { headers: { "content-type": "image/jpeg" } });
+    const EIGHT = [0, 600, 1200, 1800, 2400, 3000, 3600, 4800];
+
+    test("is stored as a separate cover asset, without a timestamp, and does not count toward the 8 frames", async () => {
+      const fetch = stubFetch(routes(jpeg));
+      const result = await strategy(10, fetch, new FakeExtractor(EIGHT)).run(ITEM_ID);
+      assert.deepEqual([result.representation, result.request.status, result.coverStored], ["frames", "stored", true]);
+      assert.deepEqual(fetch.calls, [EMBED, VIDEO_URL, POSTER]);
+      const assets = await media();
+      const frames = assets.filter((m) => m.role === "derived_frame");
+      const covers = assets.filter((m) => m.role === "cover");
+      assert.equal(frames.length, 8);
+      assert.equal(covers.length, 1);
+      assert.equal("frameTimeMs" in covers[0]!, false);
+      assert.deepEqual(new Uint8Array(readFileSync(join(dir, "media", (covers[0]!.retrieval as { storageKey: string }).storageKey))), COVER);
+      assert.equal(storedFiles().length, 9);
+    });
+
+    test("is not fetched for a video that is kept", async () => {
+      const fetch = stubFetch(routes(() => { throw new Error("the cover must not be downloaded"); }));
+      const result = await strategy(SIZE, fetch, new FakeExtractor([0])).run(ITEM_ID);
+      assert.equal(result.representation, "video");
+      assert.deepEqual(fetch.calls, [EMBED, VIDEO_URL]);
+      assert.ok((await media()).every((m) => m.role !== "cover"));
+    });
+
+    test("a failed cover download keeps the frames (no video re-download); a rate limit still stops", async () => {
+      const failed = await strategy(10, stubFetch(routes(() => new Response("", { status: 500 }))), new FakeExtractor([0, 2000])).run(ITEM_ID);
+      assert.deepEqual([failed.request.status, failed.representation, failed.coverStored], ["stored", "frames", false]);
+      assert.deepEqual((await media()).map((m) => m.role), ["derived_frame", "derived_frame"]);
+
+      await repo.saveMediaRetrievalRequest({ ...(await repo.getMediaRetrievalRequest(ITEM_ID))!, status: "pending" });
+      const limited = await strategy(10, stubFetch(routes(() => new Response("", { status: 429 }))), new FakeExtractor([0, 2000])).run(ITEM_ID);
+      assert.equal(limited.request.status, "failed");
+      assert.equal(limited.request.lastFailure?.code, "rate_limited");
+    });
+  });
+
+  test("never stores more than 8 frames or a repeated timestamp", async () => {
+    const nine = await strategy(10, stubFetch(okRoutes()), new FakeExtractor([0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000])).run(ITEM_ID);
+    assert.equal(nine.request.status, "failed");
+    assert.match(nine.request.lastFailure?.message ?? "", /9 frames \(at most 8\)/);
+    await repo.saveMediaRetrievalRequest({ ...(await repo.getMediaRetrievalRequest(ITEM_ID))!, status: "pending" });
+    const repeated = await strategy(10, stubFetch(okRoutes()), new FakeExtractor([0, 2000, 2000])).run(ITEM_ID);
+    assert.equal(repeated.request.status, "failed");
+    assert.match(repeated.request.lastFailure?.message ?? "", /repeated timestamps/);
+    assert.deepEqual(await media(), []);
     assert.deepEqual(readdirSync(tempRoot), []);
-    assert.ok((await media()).every((m) => m.role === "derived_frame"));
+  });
+
+  test("fewer than 8 useful frames are stored as they are", async () => {
+    const result = await strategy(10, stubFetch(okRoutes()), new FakeExtractor([1200])).run(ITEM_ID);
+    assert.equal(result.representation, "frames");
+    assert.deepEqual((await media()).map((m) => m.role === "derived_frame" && m.frameTimeMs), [1200]);
   });
 
   for (const [path, limit] of [["video", 1_000_000], ["frames", 0]] as const) {

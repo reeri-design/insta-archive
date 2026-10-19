@@ -2,7 +2,7 @@
  * Retrieves one ArchiveItem's media from Instagram by routing to the existing
  * adapters: single images and carousels go through MediaRetrievalService
  * (so carousel retries fetch only missing slides), videos through the Reel
- * media strategy (video kept up to the size threshold, otherwise frames).
+ * media strategy (video kept up to the size threshold, otherwise up to 8 JPEG frames and the cover).
  *
  * The embed page is fetched once per item and reused by whichever adapter
  * handles it, so routing costs no extra request.
@@ -24,12 +24,12 @@ import {
   type Fetch,
 } from "./instagram-image-spike-adapter.ts";
 import { InstagramReelSpikeAdapter } from "./instagram-reel-spike-adapter.ts";
-import { ReelMediaRetrieval, type FrameExtractor } from "./reel-media.ts";
+import { ReelMediaRetrieval, type ReelFrameExtractor } from "./reel-media.ts";
 
 export type InstagramItemRetrieverOptions = {
   repository: ArchiveRepository;
   storage: MediaStorage;
-  extractor: FrameExtractor;
+  extractor: ReelFrameExtractor;
   maxRetainedVideoBytes: number;
   fetch?: Fetch;
   tempRoot?: string;

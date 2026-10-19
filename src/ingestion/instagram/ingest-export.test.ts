@@ -219,6 +219,8 @@ function bind(target: SqliteArchiveRepository): ArchiveRepository {
     addSourceRecords: (r) => target.addSourceRecords(r),
     saveOriginalMetadata: (id, m) => target.saveOriginalMetadata(id, m),
     saveMediaAssets: (a) => target.saveMediaAssets(a),
+    replaceReelFrames: (id, f) => target.replaceReelFrames(id, f),
+    listItemIdsWithReelFrames: (o) => target.listItemIdsWithReelFrames(o),
     appendAiOrganization: (s) => target.appendAiOrganization(s),
     appendAiOrganizationIfClaimed: (s, w) => target.appendAiOrganizationIfClaimed(s, w),
     claimAiEnrichment: (id, c) => target.claimAiEnrichment(id, c),

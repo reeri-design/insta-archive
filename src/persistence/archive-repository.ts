@@ -57,6 +57,17 @@ export interface ArchiveRepository {
   /** Insert or update assets by id (e.g. a new retrieval state). */
   saveMediaAssets(assets: MediaAsset[]): Promise<void>;
 
+  /**
+   * Replace a Reel's stored frames — its `derived_frame` assets that stand in
+   * for a video that was not kept (no derivedFromAssetId) — with `frames`, in
+   * one transaction. Other assets are untouched, and so are files in media
+   * storage (the old frames' files stay until removed deliberately).
+   */
+  replaceReelFrames(itemId: ArchiveItemId, frames: MediaAsset[]): Promise<void>;
+
+  /** Ids of the owner's items that have Reel frames standing in for a video (see replaceReelFrames). */
+  listItemIdsWithReelFrames(ownerId: UserId): Promise<ArchiveItemId[]>;
+
   /** Add a new AI suggestion. Existing suggestions can never be modified. */
   appendAiOrganization(suggestion: AiOrganization): Promise<void>;
 

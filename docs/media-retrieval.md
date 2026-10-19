@@ -64,32 +64,47 @@ The rule is injected as a `PriorityPolicy`. `ownerExchangePriority(predicate)` t
 
 A storage key looks like `<2 hex chars>/<sha256(itemId)>/<sha256(assetId)>.<ext>`. Asset ids are deterministic (`<itemId>:media:<position>`, `<videoId>:frame:<ms>`), so a key is known *before* downloading. That makes "already stored?" a cheap check, and a crash between writing the file and saving the database row is repaired by the next attempt. The database stores only the key.
 
-## Reels: video or sampled frames
+## Reels: video, or frames and the cover
 
-A Reel's video is the canonical media representation (`media/instagram/reel-media.ts`). After the video is downloaded, its **byte size** decides how it is kept:
+A Reel's video is its canonical media (`media/instagram/reel-media.ts`). After the video is downloaded, its **byte size** decides how it is kept:
 
 | Downloaded video | Stored as |
 |---|---|
-| `≤ REEL_MAX_RETAINED_VIDEO_BYTES` | The video, unchanged: one `content` video asset (`byteLength`, `width`, `height`, `durationMs`) |
-| `> REEL_MAX_RETAINED_VIDEO_BYTES` | Frames only: `derived_frame` images sampled at a size-dependent interval (below) |
+| `≤ REEL_MAX_RETAINED_VIDEO_BYTES` (default **10 MB**) | The video, unchanged: one `content` video asset (`byteLength`, `width`, `height`, `durationMs`) |
+| `> REEL_MAX_RETAINED_VIDEO_BYTES` | Up to **8 JPEG** `derived_frame` images, plus the creator's **cover** as a separate `cover` asset when the page publishes one. The video is not kept. |
 
-**Frames-only sampling (experimental).** The frames are a visual summary, not a replacement for the video's full timeline, so larger videos are sampled more sparsely. The interval is chosen by the downloaded video's byte size (`FRAME_INTERVAL_BUCKETS` in `reel-media.ts`):
+The 10 MB default comes from the archive's retrieved Reels (2026-10): it keeps the original video for about 72% of them (every typical short Reel), while the 10–20 MB band took about 36% of video storage at roughly 12× the cost of its frames and cover. Duration and bitrate play no part.
 
-| Downloaded video | One frame every |
-|---|---|
-| `> 100 MB` | 12 s |
-| `> 50 MB` (up to 100 MB) | 8 s |
-| Anything else on the frames path (`> 20 MB` by default) | 4 s |
+**Choosing the frames** (`media/instagram/frame-selection.ts`, `ffmpeg-frame-extractor.ts`):
 
-Sampling keeps the first frame, then the first frame at or after each interval mark, then the final frame if it was not already picked. Frames stay in chronological order and record their actual timestamps. A boundary value (exactly 50 or 100 MB) belongs to the lower bucket.
+- The whole video is sampled in one decoding pass as tiny grayscale thumbnails (about 160 candidates, at least 250 ms apart), so the choice spans the full duration.
+- Useless frames are skipped: black, nearly black (an end card with a line of text on black) or one flat tone.
+- The first and last useful frames are kept; the rest are chosen for what differs most from everything already chosen (scene and content changes first, uncovered time second).
+- Near-duplicates are never added, so a mostly static Reel keeps fewer than 8 frames. Timestamps never repeat.
+- Only the chosen frames are written, at full size, as JPEG (ffmpeg quality 3).
+
+**The cover beside the frames:**
+
+- It is the still the creator chose, stored unchanged; it has no timestamp and does not count toward the 8 frames.
+- It is fetched only on the frames path (the adapter is told `coverIfVideoOverBytes`), never for a video that is kept.
+- It is supplementary: if its download fails, the frames are stored anyway (retrying would mean downloading the video again), except on a rate limit, which fails the request and stops the batch as usual.
+- The UI and AI enrichment still prefer the frames; the cover is shown on its own only for a Reel with no frames.
 
 - **Frames path:**
   - The video exists only in a temporary directory, which is deleted on success and on failure.
   - Frames have no `derivedFromAssetId`, carry their actual `frameTimeMs`, and record the discarded video in `retrieval.derivedFrom` (type, size, duration, dimensions).
-  - Frames are extracted with the local `ffmpeg`/`ffprobe` and saved as lossless PNG.
-  - A failed extraction leaves the request `failed`, never `stored`.
-- **Which path was used** can be read from the assets: a `content` video, frames whose `retrieval.derivedFrom` shows the video's size, or a `cover` with the video recorded as unavailable.
+  - Frames are extracted with the local `ffmpeg`/`ffprobe`.
+  - A failed extraction (or a video with no useful frame at all) leaves the request `failed`, never `stored`.
+- **Which path was used** can be read from the assets: a `content` video; frames whose `retrieval.derivedFrom` shows the video's size (with or without a cover); or a `cover` with the video recorded as unavailable.
 - **Frames may also be used later for AI and search.**
+
+### Reels stored under the earlier frame strategy
+
+Before 2026-10-06, Reels over 20 MB were stored as a PNG frame every 4–12 s (often dozens of frames, as large as the video itself). `npm run reprocess:reel-frames` lists them (read-only), and with `--apply` brings each into the current form:
+
+- Up to 8 frames are chosen **from the stored frames** with the same rules (the original videos were never kept), re-encoded as JPEG, and swapped in for the old frame assets in one transaction.
+- The old PNG files are **not deleted**: the command lists them, so they can be checked and removed deliberately.
+- Nothing is fetched, so a migrated Reel gets no cover here. Reels that were kept as video under the old 20 MB threshold stay as they are.
 
 ### Reels: when the video is withheld
 
@@ -100,7 +115,7 @@ Instagram's embed sometimes describes a Reel's video but gives no `video_url`. I
 - The request is then `stored` (all obtainable media). A failed cover download is a temporary failure and is retried; an already stored cover is never downloaded again (adapters receive `coverStored`).
 - Without a published cover, the request is `unavailable / restricted` as before, with nothing stored.
 - A manual retry checks for the video again. If it has become available it is stored as usual; the cover stays as a cover.
-- **The threshold is configurable and experimental.** Its default is 20 MB: the test Reel was 2.17 MB for 12.4 s, about 1.4 Mbit/s, so 20 MB is roughly 2 minutes.
+- **The threshold is configurable** (`REEL_MAX_RETAINED_VIDEO_BYTES`, default 10 MB; see above).
 - **Rerunning a completed Reel fetches nothing,** whichever way it was stored. Changing the threshold later does not convert Reels that are already stored.
 
 ## Running a retrieval batch
@@ -116,7 +131,7 @@ Instagram's embed sometimes describes a Reel's video but gives no `video_url`. I
 - **Routing (Instagram):** the item's embed page is fetched once and routed by post type:
   - single image → image adapter
   - carousel → carousel adapter
-  - video → Reel strategy (video kept up to the threshold, otherwise frames)
+  - video → Reel strategy (video kept up to the threshold, otherwise up to 8 JPEG frames and the cover)
 - **Outcomes per item:**
   - **Stored:** done. It is never selected or downloaded again.
   - **Unavailable** (deleted/private/not found, e.g. HTTP 404): not retried automatically.

@@ -13,7 +13,7 @@ import { LocalMediaStorage } from "../local-media-storage.ts";
 import { MediaRetrievalJob } from "../media-retrieval-job.ts";
 import { embedUrlFor, type Fetch } from "./instagram-image-spike-adapter.ts";
 import { InstagramItemRetriever } from "./instagram-item-retriever.ts";
-import type { FrameExtractor } from "./reel-media.ts";
+import type { ReelFrameExtractor } from "./reel-media.ts";
 
 const FIXTURES = join(import.meta.dirname, "../../importers/instagram/__fixtures__");
 const OWNER = "owner-1" as UserId;
@@ -45,7 +45,7 @@ function stubFetch(routes: Record<string, Route>): Fetch & { calls: string[] } {
 const html = (body: string, status = 200) => () => new Response(body, { status, headers: { "content-type": "text/html" } });
 const bytes = (type: string, label: string, status = 200) => () =>
   new Response(status === 200 ? new TextEncoder().encode(label) : "", { status, headers: { "content-type": type } });
-const noFrames: FrameExtractor = { extract: async () => { throw new Error("not expected"); } };
+const noFrames: ReelFrameExtractor = { representativeFrames: async () => { throw new Error("not expected"); } };
 
 let dir: string;
 let db: DatabaseSync;
@@ -67,7 +67,7 @@ afterEach(() => {
 const retrieverWith = (fetch: Fetch) =>
   new InstagramItemRetriever({
     repository: repo, storage: new LocalMediaStorage(join(dir, "media")), extractor: noFrames,
-    maxRetainedVideoBytes: 20_000_000, fetch, tempRoot: dir, now: () => clock,
+    maxRetainedVideoBytes: 10_000_000, fetch, tempRoot: dir, now: () => clock,
   });
 const embedCalls = (fetch: { calls: string[] }) => fetch.calls.filter((u) => u.includes("/embed/")).length;
 

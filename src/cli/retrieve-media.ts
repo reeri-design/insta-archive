@@ -26,7 +26,7 @@ const USAGE = `Usage: npm run retrieve:media -- --limit <n> [options]
   -h, --help
 
 Media goes to MEDIA_STORAGE_DIR; Reels larger than REEL_MAX_RETAINED_VIDEO_BYTES
-are kept as frames (needs ffmpeg).`;
+(default 10 MB) are kept as up to 8 JPEG frames plus the cover (needs ffmpeg).`;
 
 async function main(): Promise<number> {
   const { values } = parseArgs({

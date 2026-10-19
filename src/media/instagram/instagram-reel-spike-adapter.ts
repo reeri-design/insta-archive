@@ -1,6 +1,7 @@
 /**
- * SPIKE (Step 08B.3): retrieves the video of a public Instagram Reel. Not
- * production code: no frames, thumbnails, login or rate limiting.
+ * SPIKE (Step 08B.3): retrieves the video of a public Instagram Reel (and its
+ * cover image, when the video is withheld or too large to keep). No frames,
+ * login or rate limiting here.
  *
  * How it works (as observed 2026-10):
  *  1. GET https://www.instagram.com/p/<shortcode>/embed/captioned/ (no login).
@@ -90,15 +91,21 @@ export class InstagramReelSpikeAdapter implements MediaSourceAdapter {
     const mimeType = (download.response.headers.get("content-type") ?? "").split(";")[0]?.trim() ?? "";
     if (!mimeType.startsWith("video/")) return temporary(`Expected a video, got "${mimeType}"`);
 
+    const bytes = new Uint8Array(await download.response.arrayBuffer());
+    // A video that will not be kept is replaced by frames plus the creator's cover, when the page publishes one.
+    const over = context.coverIfVideoOverBytes;
+    const coverInfo = over !== undefined && bytes.byteLength > over ? parseReelCover(html) : undefined;
+    const cover = coverInfo && (context.coverStored ? ({ ok: "already_stored" } as const) : await this.downloadCover(coverInfo));
     return {
       ok: true,
       ...(video.isReel && { kind: "reel" as const }),
+      ...(cover && { cover }),
       assets: [{
         position: 0,
         mediaType: "video",
         result: {
           ok: true,
-          bytes: new Uint8Array(await download.response.arrayBuffer()),
+          bytes,
           mimeType,
           ...(video.width !== undefined && { width: video.width }),
           ...(video.height !== undefined && { height: video.height }),
